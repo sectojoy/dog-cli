@@ -262,10 +262,9 @@ class Runner:
 
     def run(self) -> int:
         # Get actual terminal dimensions so Claude Code renders correctly
-        try:
-            cols, rows = os.get_terminal_size(sys.stdout.fileno())
-        except Exception:
-            cols, rows = 220, 50
+        import shutil
+        size = shutil.get_terminal_size(fallback=(80, 24))
+        cols, rows = size.columns, size.lines
 
         console.print(
             f"[bold cyan]🐕 dog[/] launching: [yellow]{self.command}[/]"
@@ -291,8 +290,9 @@ class Runner:
         # Forward SIGWINCH (terminal resize) to child
         def _handle_winch(sig, frame):
             try:
-                c, r = os.get_terminal_size(sys.stdout.fileno())
-                self._child.setwinsize(r, c)
+                import shutil
+                size = shutil.get_terminal_size(fallback=(80, 24))
+                self._child.setwinsize(size.lines, size.columns)
             except Exception:
                 pass
 

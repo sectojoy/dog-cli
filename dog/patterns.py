@@ -128,7 +128,7 @@ PERMISSION_RULES: list[dict] = [
     #   Do you want to proceed? [y/n]
     {
         "label": "Permission: Yes/No prompt → approve with 'y'",
-        "pattern": r"Do you want to proceed\?.*\[y[/|]n\]|Proceed\? \[Y/n\]",
+        "pattern": r"\bDo you want to proceed\?.*\[y[/|]n\]|\bProceed\? \[Y/n\]",
         "response": "y\r",
         "delay": 0.3,
     },
@@ -142,19 +142,19 @@ PERMISSION_RULES: list[dict] = [
     },
     {
         "label": "Permission: 'Allow this time' / 'Yes, allow' prompt",
-        "pattern": r"Allow this time|Yes, allow|allow once",
+        "pattern": r"\bAllow this time\b|\bYes, allow\b|\ballow once\b",
         "response": "y\r",
         "delay": 0.3,
     },
     {
-        "label": "Permission: bash/shell approve with Enter",
-        "pattern": r"Run this command\?|Execute.*\?|Approve.*command",
+        "label": "Permission: bash/shell approve with 'y'",
+        "pattern": r"\bRun this command\?|\bExecute\b.*\?|\bApprove\b.*\bcommand\b",
         "response": "y\r",
         "delay": 0.3,
     },
     {
         "label": "Permission: file write/edit approve",
-        "pattern": r"Write to|Edit.*file|Create.*file.*approve|Allow file",
+        "pattern": r"\bWrite to\b|\bEdit\b.*\bfile\b|\bCreate\b.*\bfile\b.*\bapprove\b|\bAllow file\b",
         "response": "y\r",
         "delay": 0.3,
     },

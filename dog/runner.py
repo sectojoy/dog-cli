@@ -254,11 +254,11 @@ class Runner:
             all_rules.extend(extra_rules)
 
         self._rule_patterns = [
-            (re.compile(r["pattern"], re.IGNORECASE | re.DOTALL), r)
+            (re.compile(r["pattern"], re.IGNORECASE), r)
             for r in all_rules
         ]
         self._perm_patterns = [
-            (re.compile(r["pattern"], re.IGNORECASE | re.DOTALL), r)
+            (re.compile(r["pattern"], re.IGNORECASE), r)
             for r in PERMISSION_RULES
         ]
         self._fatal_re  = _compile(FATAL_PATTERNS)

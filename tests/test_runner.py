@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pexpect
 
 from dog.runner import PatternWatcher, Runner
-from dog.patterns import RETRY_RULES
+from dog.patterns import RETRY_RULES, SUCCESS_PATTERNS
 
 
 class FakeChild:
@@ -24,7 +24,9 @@ class FakeChild:
     def close(self, force: bool = False) -> None:
         self.closed = force
 
-    def interact(self, escape_character=None, output_filter=None) -> None:
+    def interact(self, escape_character=None, input_filter=None, output_filter=None) -> None:
+        if input_filter is not None:
+            input_filter(b"")
         if output_filter is not None:
             self.filtered_output = output_filter(b"hello from child")
 
@@ -82,6 +84,32 @@ class PatternWatcherTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.code, 3)
         self.assertTrue(self.child.closed)
+
+    def test_note_user_input_clears_success_state_after_submitted_prompt(self) -> None:
+        self.watcher._success_seen = True
+        self.watcher._buf = "old output"
+
+        self.watcher.note_user_input(b"review current changes")
+        self.watcher.note_user_input(b"\r")
+
+        self.assertFalse(self.watcher._success_seen)
+        self.assertEqual(self.watcher._buf, "")
+
+    @patch("dog.runner.console.print")
+    @patch("dog.runner.time.sleep", return_value=None)
+    def test_success_state_blocks_followup_retry_until_user_submits_again(self, _sleep, _print) -> None:
+        self.watcher._success_seen = True
+        self.watcher._buf = "stream disconnected before completion"
+        self.watcher._rule_patterns = [
+            (re.compile(r"stream disconnected", re.IGNORECASE), {"response": "continue\r", "label": "codex", "delay": 0})
+        ]
+
+        self.watcher.note_user_input(b"\r")
+        rule = self.watcher._match(self.watcher._buf, self.watcher._rule_patterns)
+
+        self.assertIsNotNone(rule)
+        self.assertTrue(self.watcher._success_seen)
+        self.assertEqual(self.child.sent, [])
 
 
 class RunnerTests(unittest.TestCase):
@@ -153,3 +181,9 @@ class PatternRulesTests(unittest.TestCase):
         self.assertIsNotNone(matched)
         self.assertEqual(matched["label"], "Codex stream disconnected before completion")
         self.assertEqual(matched["response"], "continue\r")
+
+    def test_codex_chinese_completion_summary_matches_success_patterns(self) -> None:
+        success_re = re.compile("|".join(f"(?:{pattern})" for pattern in SUCCESS_PATTERNS), re.IGNORECASE)
+        text = "• 已按 docs 的 Stage 1 文档完成第一版落地。现在工程从模板改成了 iOS 15 基线的 Stage 1 结构。"
+
+        self.assertIsNotNone(success_re.search(text))

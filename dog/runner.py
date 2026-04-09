@@ -81,6 +81,7 @@ class PatternWatcher:
         self._retries  = 0
         self._success_seen = False
         self._stop     = False
+        self._input_buf = ""
         # Prevent rapid re-firing on the same chunk
         self._last_action_time = 0.0
 
@@ -98,6 +99,23 @@ class PatternWatcher:
     def stop(self) -> None:
         self._stop = True
         self._notify.set()
+
+    def note_user_input(self, data: bytes) -> bytes:
+        text = data.decode("utf-8", errors="replace")
+        with self._lock:
+            for ch in text:
+                if ch in ("\r", "\n"):
+                    if self._input_buf.strip():
+                        self._success_seen = False
+                        self._buf = ""
+                    self._input_buf = ""
+                elif ch in ("\x7f", "\b"):
+                    self._input_buf = self._input_buf[:-1]
+                elif ch.isprintable():
+                    self._input_buf += ch
+                    if len(self._input_buf) > 512:
+                        self._input_buf = self._input_buf[-512:]
+        return data
 
     # ── Background thread entry point ─────────────────────────────────────────
 
@@ -137,6 +155,9 @@ class PatternWatcher:
                 with self._lock:
                     self._buf = ""
                 self._last_action_time = time.monotonic()
+                continue
+
+            if self._success_seen:
                 continue
 
             # 3. Permission auto-approve
@@ -332,6 +353,7 @@ class Runner:
         try:
             self._child.interact(
                 escape_character=None,              # no special escape char
+                input_filter=self._watcher.note_user_input,
                 output_filter=_output_filter,
             )
         except Exception:

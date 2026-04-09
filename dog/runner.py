@@ -120,12 +120,16 @@ class PatternWatcher:
                 console.print(
                     "\n[bold red]💀 dog: FATAL error — aborting (no retry).[/]"
                 )
-                self._child.close(force=True)
+                try:
+                    self._child.close(force=True)
+                except Exception:
+                    pass
                 os._exit(2)
 
             # 2. Success
             if self._success_re.search(buf) and not self._success_seen:
                 self._success_seen = True
+                self._retries = 0
                 console.print(
                     "\n[bold green]🎉 dog: task completed — "
                     "waiting for your next input.[/]"
@@ -155,6 +159,7 @@ class PatternWatcher:
         return None
 
     def _do_permission(self, rule: dict) -> None:
+        self._retries = 0
         delay    = rule.get("delay", 0.3)
         label    = rule.get("label", "permission")
         response = rule.get("response", "y\n")
@@ -178,7 +183,10 @@ class PatternWatcher:
             console.print(
                 f"\n[bold red]dog: max retries ({self._max_retries}) reached — giving up.[/]"
             )
-            self._child.close(force=True)
+            try:
+                self._child.close(force=True)
+            except Exception:
+                pass
             os._exit(3)
 
         self._retries += 1
@@ -230,7 +238,7 @@ class Runner:
     def __init__(
         self,
         command: str,
-        max_retries: int = 10,
+        max_retries: int = 360,
         echo: bool = True,
         timeout: float = 30.0,
         extra_rules: Optional[list[dict]] = None,

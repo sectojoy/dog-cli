@@ -35,7 +35,7 @@ console = Console(stderr=True)
 _SHARED_OPTIONS = [
     click.option(
         "--max-retries", "-r",
-        default=10,
+        default=360,
         show_default=True,
         help="Maximum number of automatic retries before giving up.",
     ),
@@ -82,7 +82,7 @@ def _add_shared(func):
 def _build_extra_rules(retry_on: tuple[str, ...], retry_cmd: str) -> list[dict]:
     if not retry_on:
         return []
-    cmd = retry_cmd if retry_cmd.endswith("\n") else retry_cmd + "\n"
+    cmd = retry_cmd if retry_cmd.endswith(("\n", "\r")) else retry_cmd + "\r"
     return [
         {"label": f"custom: {p}", "pattern": p, "response": cmd, "delay": 1.0}
         for p in retry_on

@@ -192,7 +192,7 @@ class PatternWatcher:
         self._retries += 1
         delay    = rule.get("delay", 1.0)
         label    = rule.get("label", "error")
-        response = rule.get("response", "/retry\n")
+        response = rule.get("response", "retry\n")
 
         console.print(
             Text.assemble(
@@ -229,7 +229,7 @@ class Runner:
     ----------
     command         : full command string
     max_retries     : maximum auto-retry attempts before giving up
-    echo            : (unused in v2; interact() always echoes)
+    echo            : whether child output should be shown to the terminal
     timeout         : pexpect spawn timeout (not used for interact)
     extra_rules     : additional RETRY_RULES injected at runtime
     auto_permission : auto-answer Claude Code permission prompts
@@ -246,6 +246,7 @@ class Runner:
     ) -> None:
         self.command        = command
         self.max_retries    = max_retries
+        self.echo           = echo
         self.timeout        = timeout
         self.auto_permission = auto_permission
 
@@ -322,12 +323,16 @@ class Runner:
         )
         watcher_thread.start()
 
+        def _output_filter(data: bytes) -> bytes:
+            self._watcher.feed(data)
+            return data if self.echo else b""
+
         # interact() — pexpect handles raw mode, escape sequences, Ctrl+C, etc.
         # output_filter captures output into the watcher buffer
         try:
             self._child.interact(
                 escape_character=None,              # no special escape char
-                output_filter=self._watcher.feed,  # bytes → bytes passthrough
+                output_filter=_output_filter,
             )
         except Exception:
             pass

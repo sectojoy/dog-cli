@@ -10,10 +10,10 @@ dog claude -- --model claude-opus-4-5 --prompt "refactor main.py"
 dog codex -- --full-auto "write unit tests for utils.py"
 
 # Wrap any arbitrary command
-dog run "npx claude-code --model opus" --max-retries 5
+dog run --max-retries 5 -- npx claude-code --model opus
 
 # Custom patterns from a JSON / inline flag
-dog claude --retry-on "Service Unavailable" --retry-cmd "/retry"
+dog claude --retry-on "Service Unavailable" --retry-cmd "continue"
 """
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ _SHARED_OPTIONS = [
     ),
     click.option(
         "--retry-cmd",
-        default="/retry",
+        default="continue",
         show_default=True,
         help="Command sent to the CLI when --retry-on matches.",
     ),
@@ -172,8 +172,11 @@ def cmd_codex(
 # ──────────────────────────────────────────────────────────────────────────────
 # dog run <full command>   — generic wrapper for any CLI
 # ──────────────────────────────────────────────────────────────────────────────
-@main.command(name="run")
-@click.argument("command", nargs=-1, required=True)
+@main.command(
+    name="run",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+@click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
 @_add_shared
 def cmd_run(
     command: tuple[str, ...],

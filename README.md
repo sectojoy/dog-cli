@@ -1,115 +1,147 @@
-# 🐕 dog-cli
+# dog-cli
 
-**dog** is a resilient wrapper for interactive AI CLIs like **Claude Code** and **OpenAI Codex**.  
-It uses [`pexpect`](https://pexpect.readthedocs.io/) to transparently proxy the process while silently watching for API errors, timeouts, or certificate failures — and **automatically sends retry commands** to keep the session alive.
+`dog` is a resilient wrapper around interactive AI CLIs such as Claude Code and OpenAI Codex.
+It proxies the child process through `pexpect`, watches the terminal output for retryable failures,
+and automatically sends recovery commands so the session can keep moving.
 
+```bash
+dog claude --model claude-opus-4-5 --prompt "refactor auth module"
+dog codex --full-auto "write unit tests for utils.py"
 ```
-dog claude --model claude-opus-4-5 "refactor auth module"
-```
 
----
+## What It Does
 
-## Features
-
-| Feature | Details |
-|---|---|
-| **Auto-retry** | Detects 10+ error patterns (SSL, timeout, rate-limit, network…) |
-| **Interactive passthrough** | Your keystrokes reach the child process normally |
-| **Custom patterns** | Add `--retry-on "pattern"` at runtime |
-| **Fatal detection** | Stops retrying on auth/billing errors — no infinite loops |
-| **Max retry budget** | `--max-retries` (default 10) prevents runaway sessions |
-| **Any CLI** | `dog run mycommand` wraps *any* interactive tool |
-
----
+- Wraps `claude`, `codex`, or any other terminal command.
+- Detects built-in retryable failures such as SSL issues, network failures, timeouts, and rate limits.
+- Auto-approves common Claude Code permission prompts unless you disable it.
+- Stops immediately on fatal errors such as invalid API keys or billing hard limits.
+- Lets you add runtime retry patterns with `--retry-on`.
+- Preserves the child process exit code when no dog-specific fatal condition is triggered.
 
 ## Installation
 
-```bash
-# From the repo root
-pip install -e .
+### Quick setup
 
-# Verify
-dog --version
+```bash
+./install.sh
+```
+
+That creates `.venv/`, installs the package in editable mode, and prints the resulting `dog` binary path.
+
+### Manual setup
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e .
+.venv/bin/dog --version
 ```
 
 ## Usage
 
 ### Claude Code
 
-```bash
-# All flags after `claude` are forwarded verbatim
-dog claude -- --model claude-opus-4-5 --dangerously-skip-permissions
+All arguments after `dog claude` are forwarded to `claude`.
 
-# Increase retry budget for long tasks
-dog claude -r 20 -t 60 -- "migrate the database schema"
+```bash
+dog claude --model claude-opus-4-5 --prompt "fix the flaky tests"
+dog claude -r 20 -t 60 --dangerously-skip-permissions
+dog claude --no-auto-permission --model claude-sonnet-4
 ```
 
 ### OpenAI Codex
 
+All arguments after `dog codex` are forwarded to `codex`.
+
 ```bash
 dog codex --full-auto "write unit tests for utils.py"
-dog codex -r 5 -- --model o4-mini "refactor auth module"
+dog codex -r 5 -t 60 --model o4-mini "refactor auth module"
 ```
 
 ### Generic wrapper
 
+Use `dog run` to wrap any command, including tools that expose their own flags.
+
 ```bash
 dog run npx claude-code --model opus
+dog run uv run my-agent --profile prod
+dog run --retry-on "Gateway Timeout" --retry-cmd $'\n' -- my-ai-tool --interactive
 ```
 
-### Custom retry patterns
+## Common Options
 
-```bash
-# Fire on any custom message, send Enter to continue
-dog claude --retry-on "Service Unavailable" --retry-cmd $'\n'
+| Option | Default | Meaning |
+|---|---:|---|
+| `-r, --max-retries` | `360` | Max automatic retries before `dog` exits with code `3` |
+| `-t, --timeout` | `30.0` | Spawn timeout passed to `pexpect` |
+| `--no-echo` | off | Suppress child output while still watching for retry/fatal patterns |
+| `--retry-on PATTERN` | none | Add one or more extra regex triggers at runtime |
+| `--retry-cmd TEXT` | `continue` | Command sent when a custom retry pattern matches |
+| `--no-auto-permission` | off | Disable Claude permission auto-approval |
 
-# Multiple patterns
-dog claude \
-  --retry-on "Gateway Timeout" \
-  --retry-on "overloaded" \
-  --retry-cmd "/retry"
-```
+## Built-in Behavior
 
----
+### Retry patterns
 
-## Retry Rules (Built-in)
+`dog` ships with retry rules for cases such as:
 
-| Label | Matched pattern | Response sent |
-|---|---|---|
-| Certificate / SSL error | `UNKNOWN_CERTIFICATE_VERIFICATION_ERROR`, `SSL.*Error` | `/retry\n` |
-| API connection error | `Unable to connect to API`, `ConnectionError` | `/retry\n` |
-| API timeout | `Request timed out`, `504`, `ETIMEDOUT` | `/retry\n` |
-| Rate limit / quota | `RateLimitError`, `429` | `/retry\n` (after 5 s) |
-| Network error | `ECONNRESET`, `fetch failed` | `/retry\n` |
-| Claude retry prompt | `(y to retry)` | `y\n` |
-| Codex connection error | `openai.APIConnectionError` | `continue\n` |
+- certificate / SSL failures
+- API connection failures
+- generic network errors
+- request timeouts and gateway timeouts
+- rate limit / quota responses
+- Codex `APIConnectionError` and `RateLimitError`
+- Claude prompts like `(y to retry)` and `Press Enter to continue`
 
-Add more in `dog/patterns.py` → `RETRY_RULES`.
+Most network-style retries wait `30s` before sending `retry` or `continue`.
+Interactive confirmation prompts use shorter delays such as `0.3s` or `0.5s`.
 
----
+The built-in definitions live in [`dog/patterns.py`](/Users/striver/workspace/sectojoy/dog-cli/dog/patterns.py).
+
+### Fatal patterns
+
+These stop the session immediately without retrying:
+
+- `Invalid API key`
+- `AuthenticationError`
+- `Permission denied`
+- billing hard limit failures
+- disabled account errors
+- maximum context length exceeded
+
+### Success patterns
+
+`dog` also watches for common completion messages and resets the retry counter once a task is considered complete.
 
 ## Exit Codes
 
 | Code | Meaning |
 |---|---|
-| `0` | Clean exit |
-| `1` | Failed to spawn process |
-| `2` | Fatal error detected (auth/billing) |
-| `3` | Max retries exhausted |
-| child code | Propagated from the wrapped CLI |
+| `0` | Wrapped process exited cleanly |
+| `1` | Failed to spawn the wrapped process |
+| `2` | Fatal pattern detected by `dog` |
+| `3` | Retry budget exhausted |
+| child exit code | Propagated from the wrapped CLI |
 
----
+## Development
 
-## Project Layout
+### Run tests
 
+```bash
+.venv/bin/python -m unittest discover -s tests -v
 ```
+
+### Project layout
+
+```text
 dog-cli/
+├── dog/
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── cli.py
+│   ├── patterns.py
+│   └── runner.py
+├── tests/
+├── install.sh
 ├── pyproject.toml
-├── README.md
-└── dog/
-    ├── __init__.py
-    ├── __main__.py
-    ├── cli.py        ← Click entry points
-    ├── runner.py     ← pexpect engine
-    └── patterns.py   ← all retry/fatal patterns
+└── README.md
 ```

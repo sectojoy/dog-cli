@@ -100,6 +100,13 @@ RETRY_RULES: list[dict] = [
 
     # ── Codex ──────────────────────────────────────────────────────────────────
     {
+        "label": "Codex stream disconnected before completion",
+        "pattern": r"stream disconnected before completion|Transport error:\s*network error:\s*error decoding response body",
+        "response": "continue\r",
+        "delay": 1.0,
+        "priority": 8,
+    },
+    {
         "label": "Codex APIConnectionError",
         "pattern": r"openai\.APIConnectionError|openai\.APITimeoutError",
         "response": "continue\r",

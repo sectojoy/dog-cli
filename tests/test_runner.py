@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pexpect
 
 from dog.runner import PatternWatcher, Runner
+from dog.patterns import RETRY_RULES
 
 
 class FakeChild:
@@ -136,3 +137,19 @@ class RunnerTests(unittest.TestCase):
         exit_code = Runner("missing-command").run()
 
         self.assertEqual(exit_code, 1)
+
+
+class PatternRulesTests(unittest.TestCase):
+    def test_codex_stream_disconnect_prefers_continue_over_generic_retry(self) -> None:
+        rules = sorted(RETRY_RULES, key=lambda rule: rule.get("priority", 50))
+        text = "stream disconnected before completion: Transport error: network error: error decoding response body"
+
+        matched = None
+        for rule in rules:
+            if re.search(rule["pattern"], text, re.IGNORECASE):
+                matched = rule
+                break
+
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["label"], "Codex stream disconnected before completion")
+        self.assertEqual(matched["response"], "continue\r")

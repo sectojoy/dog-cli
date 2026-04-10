@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pexpect
 
-from dog.runner import PatternWatcher, Runner
+from dog.runner import PatternWatcher, Runner, _build_echo_pattern, _signature_id
 from dog.patterns import RETRY_RULES, SUCCESS_PATTERNS
 
 
@@ -59,25 +59,27 @@ class PatternWatcherTests(unittest.TestCase):
         self.watcher._do_retry(rule, "network error")
 
         self.assertEqual(self.child.sent, ["retry\r"])
-        self.assertEqual(self.watcher._retries, 1)
+        self.assertEqual(len(self.watcher._retry_counts), 1)
+        self.assertEqual(next(iter(self.watcher._retry_counts.values())), 1)
         self.assertEqual(self.watcher._buf, "")
 
     @patch("dog.runner.console.print")
     @patch("dog.runner.time.sleep", return_value=None)
     def test_do_permission_resets_retry_budget(self, _sleep, _print) -> None:
         rule = {"label": "approve", "response": "y\r", "delay": 0}
-        self.watcher._retries = 2
+        self.watcher._retry_counts = {"sig123456": 2}
 
         self.watcher._do_permission(rule, "approve prompt")
 
         self.assertEqual(self.child.sent, ["y\r"])
-        self.assertEqual(self.watcher._retries, 0)
+        self.assertEqual(self.watcher._retry_counts, {})
 
     @patch("dog.runner.console.print")
     @patch("dog.runner.time.sleep", return_value=None)
     @patch("dog.runner.os._exit", side_effect=SystemExit(3))
     def test_do_retry_exits_when_retry_budget_is_exhausted(self, _exit, _sleep, _print) -> None:
-        self.watcher._retries = 2
+        signature_id = _signature_id("network", "network error")
+        self.watcher._retry_counts = {signature_id: 2}
 
         with self.assertRaises(SystemExit) as ctx:
             self.watcher._do_retry({"label": "network", "response": "retry\r", "delay": 0}, "network error")
@@ -88,12 +90,14 @@ class PatternWatcherTests(unittest.TestCase):
     def test_note_user_input_clears_success_state_after_submitted_prompt(self) -> None:
         self.watcher._success_seen = True
         self.watcher._buf = "old output"
+        self.watcher._retry_counts = {"sig123456": 1}
 
         self.watcher.note_user_input(b"review current changes")
         self.watcher.note_user_input(b"\r")
 
         self.assertFalse(self.watcher._success_seen)
         self.assertEqual(self.watcher._buf, "")
+        self.assertEqual(self.watcher._retry_counts, {})
 
     @patch("dog.runner.console.print")
     @patch("dog.runner.time.sleep", return_value=None)
@@ -118,14 +122,62 @@ class PatternWatcherTests(unittest.TestCase):
 
         first = self.watcher._match("network error", self.watcher._rule_patterns)
         self.assertIsNotNone(first)
-        self.watcher._last_trigger = ("codex", "network error")
+        self.watcher._last_triggered_at[_signature_id("codex", "network error")] = 10_000.0
 
-        second = self.watcher._match("network error", self.watcher._rule_patterns)
+        with patch("dog.runner.time.monotonic", return_value=10_001.0):
+            second = self.watcher._match("network error", self.watcher._rule_patterns)
         self.assertIsNone(second)
 
         self.watcher.note_user_input(b"new task\r")
         third = self.watcher._match("network error", self.watcher._rule_patterns)
         self.assertIsNotNone(third)
+
+    @patch("dog.runner.console.print")
+    @patch("dog.runner.time.sleep", return_value=None)
+    def test_do_retry_counts_per_failure_signature(self, _sleep, print_mock) -> None:
+        rule = {"label": "network", "response": "continue\r", "delay": 0}
+
+        self.watcher._do_retry(rule, "network error")
+        self.watcher._do_retry(rule, "network error")
+        self.watcher._do_retry(rule, "timeout error")
+
+        self.assertEqual(sorted(self.watcher._retry_counts.values()), [1, 2])
+        rendered = "".join(str(call.args[0]) for call in print_mock.call_args_list)
+        self.assertIn("sig", rendered)
+
+    def test_match_allows_same_signature_again_after_cooldown(self) -> None:
+        rule = {"response": "continue\r", "label": "codex", "delay": 1.0}
+        self.watcher._rule_patterns = [
+            (re.compile(r"stream disconnected", re.IGNORECASE), rule)
+        ]
+        signature_id = _signature_id("codex", "stream disconnected")
+        self.watcher._last_triggered_at[signature_id] = 100.0
+
+        with patch("dog.runner.time.monotonic", return_value=101.0):
+            blocked = self.watcher._match("stream disconnected", self.watcher._rule_patterns)
+        self.assertIsNone(blocked)
+
+        with patch("dog.runner.time.monotonic", return_value=102.1):
+            allowed = self.watcher._match("stream disconnected", self.watcher._rule_patterns)
+        self.assertIsNotNone(allowed)
+
+    def test_feed_suppresses_recent_auto_echo_line(self) -> None:
+        pattern = _build_echo_pattern("continue\r")
+        self.assertIsNotNone(pattern)
+        self.watcher._pending_echo_suppression = [(pattern, 999.0)]
+
+        with patch("dog.runner.time.monotonic", return_value=100.0):
+            visible = self.watcher.feed(b"\n\n\xe2\x80\xba continue\n")
+
+        self.assertEqual(visible, b"\n\n\n")
+        self.assertEqual(self.watcher._buf, "\n\n\n")
+
+    def test_feed_keeps_normal_output_when_no_echo_suppression_matches(self) -> None:
+        with patch("dog.runner.time.monotonic", return_value=100.0):
+            visible = self.watcher.feed(b"regular output\n")
+
+        self.assertEqual(visible, b"regular output\n")
+        self.assertEqual(self.watcher._buf, "regular output\n")
 
 
 class RunnerTests(unittest.TestCase):

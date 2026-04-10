@@ -30,6 +30,7 @@ import signal
 import sys
 import time
 import threading
+import hashlib
 from typing import Optional
 
 import pexpect
@@ -39,11 +40,31 @@ from rich.text import Text
 from dog.patterns import RETRY_RULES, PERMISSION_RULES, FATAL_PATTERNS, SUCCESS_PATTERNS
 
 console = Console(stderr=True)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
 def _compile(patterns: list[str]) -> re.Pattern:
     combined = "|".join(f"(?:{p})" for p in patterns)
     return re.compile(combined, re.IGNORECASE)
+
+
+def _normalize_signature(text: str) -> str:
+    text = _ANSI_RE.sub("", text)
+    text = re.sub(r"\s+", " ", text.strip().lower())
+    return text[:240]
+
+
+def _signature_id(label: str, matched_text: str) -> str:
+    normalized = f"{label}|{_normalize_signature(matched_text)}"
+    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:8]
+
+
+def _build_echo_pattern(command: str) -> Optional[re.Pattern]:
+    normalized = command.strip()
+    if not normalized:
+        return None
+    escaped = re.escape(normalized)
+    return re.compile(rf"(^|[\r\n])[ \t]*[›>][ \t]*{escaped}(?=($|[\r\n]))", re.IGNORECASE)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -78,11 +99,12 @@ class PatternWatcher:
         self._buf      = ""
         self._lock     = threading.Lock()
         self._notify   = threading.Event()
-        self._retries  = 0
+        self._retry_counts: dict[str, int] = {}
         self._success_seen = False
         self._stop     = False
         self._input_buf = ""
-        self._last_trigger: Optional[tuple[str, str]] = None
+        self._last_triggered_at: dict[str, float] = {}
+        self._pending_echo_suppression: list[tuple[re.Pattern, float]] = []
         # Prevent rapid re-firing on the same chunk
         self._last_action_time = 0.0
 
@@ -90,16 +112,31 @@ class PatternWatcher:
 
     def feed(self, data: bytes) -> bytes:
         text = data.decode("utf-8", errors="replace")
+        visible_text = self._suppress_auto_echo(text)
         with self._lock:
-            self._buf += text
+            self._buf += visible_text
             if len(self._buf) > 8192:
                 self._buf = self._buf[-8192:]
         self._notify.set()
-        return data                 # pass through unchanged to stdout
+        return visible_text.encode("utf-8", errors="replace")
 
     def stop(self) -> None:
         self._stop = True
         self._notify.set()
+
+    def _suppress_auto_echo(self, text: str) -> str:
+        now = time.monotonic()
+        with self._lock:
+            rules = [(pattern, expires_at) for pattern, expires_at in self._pending_echo_suppression if expires_at > now]
+            self._pending_echo_suppression = rules
+
+        if not rules:
+            return text
+
+        filtered = text
+        for pattern, _expires_at in rules:
+            filtered = pattern.sub(lambda m: m.group(1), filtered)
+        return filtered
 
     def note_user_input(self, data: bytes) -> bytes:
         text = data.decode("utf-8", errors="replace")
@@ -109,7 +146,8 @@ class PatternWatcher:
                     if self._input_buf.strip():
                         self._success_seen = False
                         self._buf = ""
-                        self._last_trigger = None
+                        self._last_triggered_at = {}
+                        self._retry_counts = {}
                     self._input_buf = ""
                 elif ch in ("\x7f", "\b"):
                     self._input_buf = self._input_buf[:-1]
@@ -149,14 +187,14 @@ class PatternWatcher:
             # 2. Success
             if self._success_re.search(buf) and not self._success_seen:
                 self._success_seen = True
-                self._retries = 0
+                self._retry_counts = {}
                 console.print(
                     "\n[bold green]🎉 dog: task completed — "
                     "waiting for your next input.[/]"
                 )
                 with self._lock:
                     self._buf = ""
-                    self._last_trigger = None
+                    self._last_triggered_at = {}
                 self._last_action_time = time.monotonic()
                 continue
 
@@ -184,14 +222,17 @@ class PatternWatcher:
             if not match:
                 continue
             matched_text = match.group(0).strip().lower()
-            trigger = (rule.get("label", "pattern"), matched_text)
-            if trigger == self._last_trigger:
+            label = rule.get("label", "pattern")
+            signature_id = _signature_id(label, matched_text)
+            cooldown = max(float(rule.get("delay", 1.0)), 2.0)
+            last_triggered_at = self._last_triggered_at.get(signature_id, 0.0)
+            if time.monotonic() - last_triggered_at < cooldown:
                 return None
             return rule, matched_text
         return None
 
     def _do_permission(self, rule: dict, matched_text: str) -> None:
-        self._retries = 0
+        self._retry_counts = {}
         delay    = rule.get("delay", 0.3)
         label    = rule.get("label", "permission")
         response = rule.get("response", "y\n")
@@ -208,13 +249,19 @@ class PatternWatcher:
         self._safe_send(response)
         with self._lock:
             self._buf = ""
-            self._last_trigger = (label, matched_text)
+            self._last_triggered_at[_signature_id(label, matched_text)] = time.monotonic()
         self._last_action_time = time.monotonic()
 
     def _do_retry(self, rule: dict, matched_text: str) -> None:
-        if self._retries >= self._max_retries:
+        label = rule.get("label", "error")
+        signature = _normalize_signature(matched_text)
+        signature_id = _signature_id(label, matched_text)
+        retry_count = self._retry_counts.get(signature_id, 0)
+
+        if retry_count >= self._max_retries:
             console.print(
-                f"\n[bold red]dog: max retries ({self._max_retries}) reached — giving up.[/]"
+                "\n[bold red]dog: max retries (%d) reached for failure sig %s — giving up.[/]"
+                % (self._max_retries, signature_id)
             )
             try:
                 self._child.close(force=True)
@@ -222,17 +269,20 @@ class PatternWatcher:
                 pass
             os._exit(3)
 
-        self._retries += 1
+        retry_count += 1
+        self._retry_counts[signature_id] = retry_count
         delay    = rule.get("delay", 1.0)
-        label    = rule.get("label", "error")
         response = rule.get("response", "retry\n")
+        signature_preview = signature[:72] if signature else label.lower()
 
         console.print(
             Text.assemble(
                 "\n[bold yellow]⚡ dog:[/] ",
                 ("auto-retry", "bold yellow"),
-                f" #{self._retries}/{self._max_retries}  ",
+                f" #{retry_count}/{self._max_retries}  ",
                 (f"({label})", "dim"),
+                f"  [sig {signature_id}]  ",
+                (repr(signature_preview), "dim"),
                 f"  — waiting {delay}s then sending: ",
                 (repr(response.strip()), "cyan"),
             )
@@ -241,11 +291,15 @@ class PatternWatcher:
         self._safe_send(response)
         with self._lock:
             self._buf = ""
-            self._last_trigger = (label, matched_text)
+            self._last_triggered_at[signature_id] = time.monotonic()
         self._last_action_time = time.monotonic()
 
     def _safe_send(self, text: str) -> None:
         try:
+            pattern = _build_echo_pattern(text)
+            if pattern:
+                with self._lock:
+                    self._pending_echo_suppression.append((pattern, time.monotonic() + 2.5))
             self._child.send(text)
         except pexpect.exceptions.ExceptionPexpect as e:
             console.print(f"[red]dog: send failed:[/] {e}")

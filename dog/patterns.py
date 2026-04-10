@@ -13,7 +13,7 @@ from __future__ import annotations
 # ---------------------------------------------------------------------------
 # AUTO-RETRY RULES — triggered on error output, sends retry command
 # ---------------------------------------------------------------------------
-RETRY_RULES: list[dict] = [
+COMMON_RETRY_RULES: list[dict] = [
 
     # ── Real-world API error strings seen in Claude Code ─────────────────────
     {
@@ -81,46 +81,66 @@ RETRY_RULES: list[dict] = [
         "delay": 30.0,
         "priority": 30,
     },
-
-    # ── Claude Code — interactive prompts to confirm/retry ────────────────────
-    {
-        "label": "Claude explicit (y to retry) prompt",
-        "pattern": r"\(y to retry\)",
-        "response": "y\r",
-        "delay": 0.5,
-        "priority": 5,
-    },
-    {
-        "label": "Claude 'Press Enter to continue'",
-        "pattern": r"Press Enter to continue",
-        "response": "\r",
-        "delay": 0.3,
-        "priority": 5,
-    },
-
-    # ── Codex ──────────────────────────────────────────────────────────────────
-    {
-        "label": "Codex stream disconnected before completion",
-        "pattern": r"stream disconnected before completion|Transport error:\s*network error:\s*error decoding response body",
-        "response": "continue\r",
-        "delay": 1.0,
-        "priority": 8,
-    },
-    {
-        "label": "Codex APIConnectionError",
-        "pattern": r"openai\.APIConnectionError|openai\.APITimeoutError",
-        "response": "continue\r",
-        "delay": 30.0,
-        "priority": 10,
-    },
-    {
-        "label": "Codex RateLimitError",
-        "pattern": r"openai\.RateLimitError",
-        "response": "continue\r",
-        "delay": 30.0,
-        "priority": 10,
-    },
 ]
+
+TOOL_RETRY_RULES: dict[str, list[dict]] = {
+    "claude": [
+        {
+            "label": "Claude explicit (y to retry) prompt",
+            "pattern": r"\(y to retry\)",
+            "response": "y\r",
+            "delay": 0.5,
+            "priority": 5,
+        },
+        {
+            "label": "Claude 'Press Enter to continue'",
+            "pattern": r"Press Enter to continue",
+            "response": "\r",
+            "delay": 0.3,
+            "priority": 5,
+        },
+    ],
+    "codex": [
+        {
+            "label": "Codex stream disconnected before completion",
+            "pattern": (
+                r"stream disconnected before completion"
+                r"|stream closed before response\.completed"
+                r"|Transport error:\s*network error:\s*error decoding response body"
+            ),
+            "response": "continue\r",
+            "delay": 3.0,
+            "priority": 8,
+        },
+        {
+            "label": "Codex 429 Too Many Requests",
+            "pattern": r"exceeded retry limit, last status:\s*429 Too Many Requests|429 Too Many Requests",
+            "response": "continue\r",
+            "delay": 30.0,
+            "priority": 9,
+        },
+        {
+            "label": "Codex APIConnectionError",
+            "pattern": r"openai\.APIConnectionError|openai\.APITimeoutError",
+            "response": "continue\r",
+            "delay": 30.0,
+            "priority": 10,
+        },
+        {
+            "label": "Codex RateLimitError",
+            "pattern": r"openai\.RateLimitError",
+            "response": "continue\r",
+            "delay": 30.0,
+            "priority": 10,
+        },
+    ],
+}
+
+RETRY_RULES: list[dict] = (
+    COMMON_RETRY_RULES
+    + TOOL_RETRY_RULES["claude"]
+    + TOOL_RETRY_RULES["codex"]
+)
 
 # ---------------------------------------------------------------------------
 # PERMISSION AUTO-APPROVE RULES

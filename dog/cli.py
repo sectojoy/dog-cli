@@ -137,7 +137,7 @@ def cmd_claude(
     """
     extra_args = " ".join(shlex.quote(a) for a in args)
     command = f"claude {extra_args}".strip()
-    _run(command, max_retries, timeout, no_echo, retry_on, retry_cmd, not no_auto_permission)
+    _run(command, max_retries, timeout, no_echo, retry_on, retry_cmd, not no_auto_permission, "claude")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -169,7 +169,7 @@ def cmd_codex(
     """
     extra_args = " ".join(shlex.quote(a) for a in args)
     command = f"codex {extra_args}".strip()
-    _run(command, max_retries, timeout, no_echo, retry_on, retry_cmd, not no_auto_permission)
+    _run(command, max_retries, timeout, no_echo, retry_on, retry_cmd, not no_auto_permission, "codex")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -201,7 +201,7 @@ def cmd_opencode(
     """
     extra_args = " ".join(shlex.quote(a) for a in args)
     command = f"opencode {extra_args}".strip()
-    _run(command, max_retries, timeout, no_echo, retry_on, retry_cmd, not no_auto_permission)
+    _run(command, max_retries, timeout, no_echo, retry_on, retry_cmd, not no_auto_permission, "opencode")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -230,7 +230,7 @@ def cmd_run(
       dog run --retry-on "Gateway Timeout" --retry-cmd "\\n" -- my-ai-tool
     """
     cmd_str = " ".join(shlex.quote(a) for a in command)
-    _run(cmd_str, max_retries, timeout, no_echo, retry_on, retry_cmd, not no_auto_permission)
+    _run(cmd_str, max_retries, timeout, no_echo, retry_on, retry_cmd, not no_auto_permission, None)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -244,6 +244,7 @@ def _run(
     retry_on: tuple[str, ...],
     retry_cmd: str,
     auto_permission: bool = True,
+    profile: str | None = None,
 ) -> None:
     extra_rules = _build_extra_rules(retry_on, retry_cmd)
     runner = Runner(
@@ -253,6 +254,7 @@ def _run(
         timeout=timeout,
         extra_rules=extra_rules,
         auto_permission=auto_permission,
+        profile=profile,
     )
     exit_code = runner.run()
     sys.exit(exit_code)

@@ -37,7 +37,13 @@ import pexpect
 from rich.console import Console
 from rich.text import Text
 
-from dog.patterns import RETRY_RULES, PERMISSION_RULES, FATAL_PATTERNS, SUCCESS_PATTERNS
+from dog.patterns import (
+    COMMON_RETRY_RULES,
+    TOOL_RETRY_RULES,
+    PERMISSION_RULES,
+    FATAL_PATTERNS,
+    SUCCESS_PATTERNS,
+)
 
 console = Console(stderr=True)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -64,7 +70,10 @@ def _build_echo_pattern(command: str) -> Optional[re.Pattern]:
     if not normalized:
         return None
     escaped = re.escape(normalized)
-    return re.compile(rf"(^|[\r\n])[ \t]*[›>][ \t]*{escaped}(?=($|[\r\n]))", re.IGNORECASE)
+    return re.compile(
+        rf"(^|[\r\n])[ \t]*(?:[›>][ \t]*)?{escaped}(?=($|[\r\n]))",
+        re.IGNORECASE,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,9 +108,9 @@ class PatternWatcher:
         self._buf      = ""
         self._lock     = threading.Lock()
         self._notify   = threading.Event()
+        self._stop_event = threading.Event()
         self._retry_counts: dict[str, int] = {}
         self._success_seen = False
-        self._stop     = False
         self._input_buf = ""
         self._last_triggered_at: dict[str, float] = {}
         self._pending_echo_suppression: list[tuple[re.Pattern, float]] = []
@@ -121,7 +130,7 @@ class PatternWatcher:
         return visible_text.encode("utf-8", errors="replace")
 
     def stop(self) -> None:
-        self._stop = True
+        self._stop_event.set()
         self._notify.set()
 
     def _suppress_auto_echo(self, text: str) -> str:
@@ -160,11 +169,13 @@ class PatternWatcher:
     # ── Background thread entry point ─────────────────────────────────────────
 
     def run(self) -> None:
-        while not self._stop:
+        while not self._stop_event.is_set():
             fired = self._notify.wait(timeout=1.0)
             if not fired:
                 continue
             self._notify.clear()
+            if self._stop_event.is_set():
+                break
 
             with self._lock:
                 buf = self._buf
@@ -216,6 +227,18 @@ class PatternWatcher:
                 self._success_seen = False
                 self._do_retry(rule, matched[1])
 
+    def _wait_for_delay(self, delay: float) -> bool:
+        return not self._stop_event.wait(max(delay, 0.0))
+
+    def _child_is_alive(self) -> bool:
+        isalive = getattr(self._child, "isalive", None)
+        if callable(isalive):
+            try:
+                return bool(isalive())
+            except Exception:
+                return False
+        return getattr(self._child, "exitstatus", None) is None
+
     def _match(self, text: str, patterns: list) -> Optional[tuple[dict, str]]:
         for pat, rule in patterns:
             match = pat.search(text)
@@ -245,7 +268,8 @@ class PatternWatcher:
                 (repr(response.strip()) or "<Enter>", "cyan"),
             )
         )
-        time.sleep(delay)
+        if not self._wait_for_delay(delay):
+            return
         self._safe_send(response)
         with self._lock:
             self._buf = ""
@@ -287,7 +311,8 @@ class PatternWatcher:
                 (repr(response.strip()), "cyan"),
             )
         )
-        time.sleep(delay)
+        if not self._wait_for_delay(delay):
+            return
         self._safe_send(response)
         with self._lock:
             self._buf = ""
@@ -295,6 +320,8 @@ class PatternWatcher:
         self._last_action_time = time.monotonic()
 
     def _safe_send(self, text: str) -> None:
+        if self._stop_event.is_set() or not self._child_is_alive():
+            return
         try:
             pattern = _build_echo_pattern(text)
             if pattern:
@@ -331,6 +358,7 @@ class Runner:
         timeout: float = 30.0,
         extra_rules: Optional[list[dict]] = None,
         auto_permission: bool = True,
+        profile: Optional[str] = None,
     ) -> None:
         self.command        = command
         self.max_retries    = max_retries
@@ -338,9 +366,12 @@ class Runner:
         self.timeout        = timeout
         self.auto_permission = auto_permission
 
-        all_rules = sorted(RETRY_RULES, key=lambda r: r.get("priority", 50))
+        all_rules = list(COMMON_RETRY_RULES)
+        if profile:
+            all_rules.extend(TOOL_RETRY_RULES.get(profile, []))
         if extra_rules:
             all_rules.extend(extra_rules)
+        all_rules = sorted(all_rules, key=lambda r: r.get("priority", 50))
 
         self._rule_patterns = [
             (re.compile(r["pattern"], re.IGNORECASE), r)
@@ -427,6 +458,7 @@ class Runner:
             pass
         finally:
             self._watcher.stop()
+            watcher_thread.join(timeout=1.0)
             signal.signal(signal.SIGWINCH, old_winch)
 
         # Collect exit code

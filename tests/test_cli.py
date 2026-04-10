@@ -62,6 +62,7 @@ class CliCommandTests(unittest.TestCase):
             ("Service Unavailable",),
             "continue",
             False,
+            "claude",
         )
 
     @patch("dog.cli._run")
@@ -80,6 +81,7 @@ class CliCommandTests(unittest.TestCase):
             (),
             "continue",
             True,
+            None,
         )
 
     @patch("dog.cli._run")
@@ -109,4 +111,5 @@ class CliCommandTests(unittest.TestCase):
             ("stream disconnected",),
             "continue",
             True,
+            "opencode",
         )

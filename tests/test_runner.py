@@ -1,22 +1,31 @@
 import re
 import signal
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
 import pexpect
 
 from dog.runner import PatternWatcher, Runner, _build_echo_pattern, _signature_id
-from dog.patterns import RETRY_RULES, SUCCESS_PATTERNS
+from dog.patterns import RETRY_RULES, SUCCESS_PATTERNS, TOOL_RETRY_RULES
 
 
 class FakeChild:
-    def __init__(self, exitstatus: int = 0) -> None:
+    def __init__(
+        self,
+        exitstatus: int | None = 0,
+        interact_output: bytes = b"hello from child",
+        interact_delay: float = 0.0,
+    ) -> None:
         self.exitstatus = exitstatus
         self.sent: list[str] = []
         self.closed = False
         self.wait_called = False
         self.filtered_output: bytes | None = None
         self.window_size: tuple[int, int] | None = None
+        self.interact_output = interact_output
+        self.interact_delay = interact_delay
 
     def send(self, text: str) -> None:
         self.sent.append(text)
@@ -28,7 +37,11 @@ class FakeChild:
         if input_filter is not None:
             input_filter(b"")
         if output_filter is not None:
-            self.filtered_output = output_filter(b"hello from child")
+            self.filtered_output = output_filter(self.interact_output)
+        if self.interact_delay:
+            time.sleep(self.interact_delay)
+        if self.exitstatus is None:
+            self.exitstatus = 0
 
     def wait(self) -> None:
         self.wait_called = True
@@ -36,10 +49,13 @@ class FakeChild:
     def setwinsize(self, rows: int, cols: int) -> None:
         self.window_size = (rows, cols)
 
+    def isalive(self) -> bool:
+        return self.exitstatus is None
+
 
 class PatternWatcherTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.child = FakeChild()
+        self.child = FakeChild(exitstatus=None)
         self.watcher = PatternWatcher(
             child=self.child,
             rule_patterns=[],
@@ -73,6 +89,29 @@ class PatternWatcherTests(unittest.TestCase):
 
         self.assertEqual(self.child.sent, ["y\r"])
         self.assertEqual(self.watcher._retry_counts, {})
+
+    @patch("dog.runner.console.print")
+    def test_stop_cancels_pending_retry_before_send(self, _print) -> None:
+        self.child.exitstatus = None
+        done = threading.Thread(
+            target=self.watcher._do_retry,
+            args=({"label": "network", "response": "retry\r", "delay": 5.0}, "network error"),
+        )
+
+        done.start()
+        time.sleep(0.05)
+        self.watcher.stop()
+        done.join(timeout=1.0)
+
+        self.assertFalse(done.is_alive())
+        self.assertEqual(self.child.sent, [])
+
+    def test_safe_send_skips_dead_child(self) -> None:
+        self.child.exitstatus = 1
+
+        self.watcher._safe_send("continue\r")
+
+        self.assertEqual(self.child.sent, [])
 
     @patch("dog.runner.console.print")
     @patch("dog.runner.time.sleep", return_value=None)
@@ -172,6 +211,17 @@ class PatternWatcherTests(unittest.TestCase):
         self.assertEqual(visible, b"\n\n\n")
         self.assertEqual(self.watcher._buf, "\n\n\n")
 
+    def test_feed_suppresses_plain_auto_echo_line_without_prompt_marker(self) -> None:
+        pattern = _build_echo_pattern("continue\r")
+        self.assertIsNotNone(pattern)
+        self.watcher._pending_echo_suppression = [(pattern, 999.0)]
+
+        with patch("dog.runner.time.monotonic", return_value=100.0):
+            visible = self.watcher.feed(b"\ncontinue\n")
+
+        self.assertEqual(visible, b"\n\n")
+        self.assertEqual(self.watcher._buf, "\n\n")
+
     def test_feed_keeps_normal_output_when_no_echo_suppression_matches(self) -> None:
         with patch("dog.runner.time.monotonic", return_value=100.0):
             visible = self.watcher.feed(b"regular output\n")
@@ -225,6 +275,30 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(child.filtered_output, b"")
 
     @patch("dog.runner.console.print")
+    @patch("dog.runner.signal.signal")
+    @patch("dog.runner.signal.getsignal", return_value=signal.SIG_DFL)
+    @patch("dog.runner.pexpect.spawn")
+    def test_run_stops_watcher_before_pending_retry_can_send(
+        self,
+        spawn_mock,
+        _getsignal,
+        _signal,
+        _print,
+    ) -> None:
+        child = FakeChild(
+            exitstatus=None,
+            interact_output=b"stream disconnected before completion",
+            interact_delay=0.05,
+        )
+        spawn_mock.return_value = child
+
+        exit_code = Runner("codex", max_retries=2).run()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(child.sent, [])
+        self.assertTrue(child.wait_called)
+
+    @patch("dog.runner.console.print")
     @patch(
         "dog.runner.pexpect.spawn",
         side_effect=pexpect.exceptions.ExceptionPexpect("boom"),
@@ -248,6 +322,34 @@ class PatternRulesTests(unittest.TestCase):
 
         self.assertIsNotNone(matched)
         self.assertEqual(matched["label"], "Codex stream disconnected before completion")
+        self.assertEqual(matched["response"], "continue\r")
+
+    def test_codex_direct_stream_closed_message_uses_continue(self) -> None:
+        rules = TOOL_RETRY_RULES["codex"]
+        text = "stream closed before response.completed"
+
+        matched = None
+        for rule in sorted(rules, key=lambda rule: rule.get("priority", 50)):
+            if re.search(rule["pattern"], text, re.IGNORECASE):
+                matched = rule
+                break
+
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["label"], "Codex stream disconnected before completion")
+        self.assertEqual(matched["response"], "continue\r")
+
+    def test_codex_429_uses_continue_instead_of_generic_retry(self) -> None:
+        rules = TOOL_RETRY_RULES["codex"] + RETRY_RULES
+        text = "exceeded retry limit, last status: 429 Too Many Requests"
+
+        matched = None
+        for rule in sorted(rules, key=lambda rule: rule.get("priority", 50)):
+            if re.search(rule["pattern"], text, re.IGNORECASE):
+                matched = rule
+                break
+
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["label"], "Codex 429 Too Many Requests")
         self.assertEqual(matched["response"], "continue\r")
 
     def test_codex_chinese_completion_summary_matches_success_patterns(self) -> None:

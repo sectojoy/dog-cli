@@ -31,7 +31,6 @@ import sys
 import time
 import threading
 import hashlib
-import itertools
 from typing import Optional
 
 import pexpect
@@ -48,7 +47,6 @@ from dog.patterns import (
 console = Console(stderr=True)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _STATUS_LOCK = threading.Lock()
-_STATUS_VISIBLE = False
 _LAST_STATUS_MESSAGE = ""
 
 
@@ -80,38 +78,22 @@ def _build_echo_pattern(command: str) -> Optional[re.Pattern]:
 
 
 def _status_write(message: str = "", *, newline: bool = False, clear: bool = False) -> None:
-    global _STATUS_VISIBLE, _LAST_STATUS_MESSAGE
+    global _LAST_STATUS_MESSAGE
     with _STATUS_LOCK:
-        if sys.stderr.isatty():
-            if clear or _STATUS_VISIBLE:
-                sys.stderr.write("\r\033[2K")
-            if message:
-                sys.stderr.write(message)
-                _STATUS_VISIBLE = not newline
-                _LAST_STATUS_MESSAGE = message
-            elif clear:
-                _STATUS_VISIBLE = False
-                _LAST_STATUS_MESSAGE = ""
-            if newline:
-                sys.stderr.write("\n")
-                _STATUS_VISIBLE = False
-                _LAST_STATUS_MESSAGE = ""
-        else:
-            if clear and not message and not newline:
-                return
-            if message and message == _LAST_STATUS_MESSAGE and not newline:
-                return
-            if message:
-                sys.stderr.write(message)
-            if newline or message:
-                sys.stderr.write("\n")
-            _STATUS_VISIBLE = False
-            _LAST_STATUS_MESSAGE = message if not newline else ""
+        if clear and not message and not newline:
+            return
+        if message and message == _LAST_STATUS_MESSAGE:
+            return
+        if message:
+            sys.stderr.write(message)
+        if newline or message:
+            sys.stderr.write("\n")
+        _LAST_STATUS_MESSAGE = message if message else ""
         sys.stderr.flush()
 
 
 def _status_clear() -> None:
-    _status_write(clear=True)
+    return None
 
 
 def _status_show(message: str) -> None:
@@ -142,6 +124,7 @@ class PatternWatcher:
         success_re: re.Pattern,
         max_retries: int,
         auto_permission: bool,
+        retry_counts: Optional[dict[str, int]] = None,
     ) -> None:
         self._child            = child
         self._rule_patterns    = rule_patterns
@@ -155,7 +138,7 @@ class PatternWatcher:
         self._lock     = threading.Lock()
         self._notify   = threading.Event()
         self._stop_event = threading.Event()
-        self._retry_counts: dict[str, int] = {}
+        self._retry_counts = retry_counts if retry_counts is not None else {}
         self._success_seen = False
         self._input_buf = ""
         self._last_triggered_at: dict[str, float] = {}
@@ -163,6 +146,7 @@ class PatternWatcher:
         self._active_actions = 0
         self._idle_event = threading.Event()
         self._idle_event.set()
+        self._restart_request: Optional[dict[str, str | int]] = None
         # Prevent rapid re-firing on the same chunk
         self._last_action_time = 0.0
 
@@ -171,8 +155,6 @@ class PatternWatcher:
     def feed(self, data: bytes) -> bytes:
         text = data.decode("utf-8", errors="replace")
         visible_text = self._suppress_auto_echo(text)
-        if visible_text:
-            _status_clear()
         with self._lock:
             self._buf += visible_text
             if len(self._buf) > 8192:
@@ -183,6 +165,12 @@ class PatternWatcher:
     def stop(self) -> None:
         self._stop_event.set()
         self._notify.set()
+
+    def consume_restart_request(self) -> Optional[dict[str, str | int]]:
+        with self._lock:
+            request = self._restart_request
+            self._restart_request = None
+            return request
 
     def wait_for_idle(self, start_timeout: float = 0.25, finish_timeout: float = 0.0) -> bool:
         deadline = time.monotonic() + max(start_timeout, 0.0)
@@ -255,7 +243,6 @@ class PatternWatcher:
 
             # 1. Fatal
             if self._fatal_re.search(buf):
-                _status_clear()
                 console.print(
                     "\n[bold red]💀 dog: FATAL error — aborting (no retry).[/]"
                 )
@@ -269,7 +256,6 @@ class PatternWatcher:
             if self._success_re.search(buf) and not self._success_seen:
                 self._success_seen = True
                 self._retry_counts = {}
-                _status_clear()
                 console.print(
                     "\n[bold green]🎉 dog: task completed — "
                     "waiting for your next input.[/]"
@@ -311,32 +297,16 @@ class PatternWatcher:
             return True
 
         response_preview = repr(response.strip()) or "<Enter>"
-        spinner = itertools.cycle("|/-\\")
         deadline = time.monotonic() + delay
-        last_rendered = None
 
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                _status_clear()
                 return True
             if self._stop_event.wait(min(0.2, remaining)):
-                _status_clear()
                 return False
             if self._user_is_typing():
-                if not sys.stderr.isatty():
-                    _status_log("dog auto-retry cancelled: local input detected")
-                else:
-                    _status_clear()
                 return False
-            frame = next(spinner)
-            message = (
-                f"dog waiting {frame} {remaining:4.1f}s before {response_preview} "
-                f"({label}, {retry_count}/{self._max_retries})"
-            )
-            if message != last_rendered:
-                _status_show(message)
-                last_rendered = message
 
     def _child_is_alive(self) -> bool:
         isalive = getattr(self._child, "isalive", None)
@@ -376,14 +346,13 @@ class PatternWatcher:
             label    = rule.get("label", "permission")
             response = rule.get("response", "y\n")
 
-            if delay <= 0 and not sys.stderr.isatty():
-                _status_log(
-                    f"dog auto-approve: {label} -> {repr(response.strip()) or '<Enter>'}"
-                )
+            _status_log(
+                f"dog auto-approve: {label}; "
+                f"sending {repr(response.strip()) or '<Enter>'} in {delay:.1f}s"
+            )
             if not self._wait_with_progress(delay, response=response, label=label, retry_count=1):
                 return
             self._safe_send(response)
-            _status_clear()
             with self._lock:
                 self._buf = ""
                 self._last_triggered_at[_signature_id(label, matched_text)] = time.monotonic()
@@ -420,11 +389,10 @@ class PatternWatcher:
             delay    = rule.get("delay", 1.0)
             response = rule.get("response", "retry\n")
 
-            if delay <= 0 and not sys.stderr.isatty():
-                _status_log(
-                    f"dog retry {retry_count}/{self._max_retries}: {label}; "
-                    f"sending {repr(response.strip()) or '<Enter>'} now"
-                )
+            _status_log(
+                f"dog retry {retry_count}/{self._max_retries}: {label}; "
+                f"sending {repr(response.strip()) or '<Enter>'} in {delay:.1f}s"
+            )
             if not self._wait_with_progress(
                 delay,
                 response=response,
@@ -432,8 +400,15 @@ class PatternWatcher:
                 retry_count=retry_count,
             ):
                 return
-            self._safe_send(response)
-            _status_clear()
+            if self._child_is_alive():
+                self._safe_send(response)
+            else:
+                with self._lock:
+                    self._restart_request = {
+                        "label": label,
+                        "signature_id": signature_id,
+                        "retry_count": retry_count,
+                    }
             with self._lock:
                 self._buf = ""
                 self._last_triggered_at[signature_id] = time.monotonic()
@@ -454,7 +429,6 @@ class PatternWatcher:
                     self._pending_echo_suppression.append((pattern, time.monotonic() + 2.5))
             self._child.send(text)
         except pexpect.exceptions.ExceptionPexpect as e:
-            _status_clear()
             console.print(f"[red]dog: send failed:[/] {e}")
 
 
@@ -511,6 +485,10 @@ class Runner:
         self._success_re = _compile(SUCCESS_PATTERNS)
         self._child: Optional[pexpect.spawn] = None
         self._watcher: Optional[PatternWatcher] = None
+        self._retry_counts: dict[str, int] = {}
+        self._max_action_delay = max(
+            [0.3] + [float(rule.get("delay", 0.0)) for rule in all_rules] + [float(rule.get("delay", 0.0)) for rule in PERMISSION_RULES]
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -528,81 +506,91 @@ class Runner:
             "auto-permission: %s  │  auto-retry: ON (max %d)[/]"
             % ("ON" if self.auto_permission else "OFF", self.max_retries)
         )
+        old_winch = signal.getsignal(signal.SIGWINCH)
 
-        try:
-            self._child = pexpect.spawn(
-                self.command,
-                encoding=None,       # bytes mode — cleaner for PTY passthrough
-                timeout=self.timeout,
-                echo=False,
-                dimensions=(rows, cols),
-            )
-        except pexpect.exceptions.ExceptionPexpect as e:
-            console.print(f"[red]Failed to spawn process:[/] {e}")
-            return 1
-
-        # Forward SIGWINCH (terminal resize) to child
-        def _handle_winch(sig, frame):
+        while True:
             try:
-                import shutil
-                size = shutil.get_terminal_size(fallback=(80, 24))
-                self._child.setwinsize(size.lines, size.columns)
+                self._child = pexpect.spawn(
+                    self.command,
+                    encoding=None,       # bytes mode — cleaner for PTY passthrough
+                    timeout=self.timeout,
+                    echo=False,
+                    dimensions=(rows, cols),
+                )
+            except pexpect.exceptions.ExceptionPexpect as e:
+                console.print(f"[red]Failed to spawn process:[/] {e}")
+                signal.signal(signal.SIGWINCH, old_winch)
+                return 1
+
+            # Forward SIGWINCH (terminal resize) to child
+            def _handle_winch(sig, frame):
+                try:
+                    import shutil
+                    size = shutil.get_terminal_size(fallback=(80, 24))
+                    self._child.setwinsize(size.lines, size.columns)
+                except Exception:
+                    pass
+
+            signal.signal(signal.SIGWINCH, _handle_winch)
+
+            # Start pattern watcher in background thread
+            self._watcher = PatternWatcher(
+                child=self._child,
+                rule_patterns=self._rule_patterns,
+                permission_patterns=self._perm_patterns,
+                fatal_re=self._fatal_re,
+                success_re=self._success_re,
+                max_retries=self.max_retries,
+                auto_permission=self.auto_permission,
+                retry_counts=self._retry_counts,
+            )
+            watcher_thread = threading.Thread(
+                target=self._watcher.run, daemon=True, name="dog-watcher"
+            )
+            watcher_thread.start()
+
+            def _output_filter(data: bytes) -> bytes:
+                visible = self._watcher.feed(data)
+                return visible if self.echo else b""
+
+            # interact() — pexpect handles raw mode, escape sequences, Ctrl+C, etc.
+            # output_filter captures output into the watcher buffer
+            try:
+                self._child.interact(
+                    escape_character=None,              # no special escape char
+                    input_filter=self._watcher.note_user_input,
+                    output_filter=_output_filter,
+                )
             except Exception:
                 pass
+            finally:
+                if self._watcher is not None:
+                    self._watcher.wait_for_idle(
+                        start_timeout=0.35,
+                        finish_timeout=self._max_action_delay + 1.0,
+                    )
+                self._watcher.stop()
+                watcher_thread.join(timeout=1.0)
+                signal.signal(signal.SIGWINCH, old_winch)
 
-        old_winch = signal.getsignal(signal.SIGWINCH)
-        signal.signal(signal.SIGWINCH, _handle_winch)
+            # Collect exit code
+            try:
+                self._child.wait()
+            except Exception:
+                pass
+            code = self._child.exitstatus if self._child.exitstatus is not None else 0
+            restart_request = self._watcher.consume_restart_request() if self._watcher is not None else None
 
-        # Start pattern watcher in background thread
-        self._watcher = PatternWatcher(
-            child=self._child,
-            rule_patterns=self._rule_patterns,
-            permission_patterns=self._perm_patterns,
-            fatal_re=self._fatal_re,
-            success_re=self._success_re,
-            max_retries=self.max_retries,
-            auto_permission=self.auto_permission,
-        )
-        watcher_thread = threading.Thread(
-            target=self._watcher.run, daemon=True, name="dog-watcher"
-        )
-        watcher_thread.start()
-
-        def _output_filter(data: bytes) -> bytes:
-            self._watcher.feed(data)
-            return data if self.echo else b""
-
-        # interact() — pexpect handles raw mode, escape sequences, Ctrl+C, etc.
-        # output_filter captures output into the watcher buffer
-        try:
-            self._child.interact(
-                escape_character=None,              # no special escape char
-                input_filter=self._watcher.note_user_input,
-                output_filter=_output_filter,
-            )
-        except Exception:
-            pass
-        finally:
-            if self._watcher is not None:
-                self._watcher.wait_for_idle(
-                    start_timeout=0.35,
-                    finish_timeout=0.0 if not self._child.isalive() else 31.0,
+            if restart_request:
+                console.print(
+                    "\n[yellow]dog: retryable failure persisted after the tool exited; restarting command "
+                    f"({restart_request['label']}, {restart_request['retry_count']}/{self.max_retries}).[/]"
                 )
-            self._watcher.stop()
-            watcher_thread.join(timeout=1.0)
-            signal.signal(signal.SIGWINCH, old_winch)
+                continue
 
-        # Collect exit code
-        try:
-            self._child.wait()
-        except Exception:
-            pass
-        code = self._child.exitstatus if self._child.exitstatus is not None else 0
+            if code == 0 or self._watcher._success_seen:
+                console.print("\n[bold green]✓ dog: session finished cleanly.[/]")
+            else:
+                console.print(f"\n[bold red]✗ dog: process exited with code {code}.[/]")
 
-        _status_clear()
-        if code == 0 or self._watcher._success_seen:
-            console.print("\n[bold green]✓ dog: session finished cleanly.[/]")
-        else:
-            console.print(f"\n[bold red]✗ dog: process exited with code {code}.[/]")
-
-        return code
+            return code

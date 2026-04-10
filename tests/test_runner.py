@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pexpect
 
 import dog.runner as runner_mod
-from dog.runner import PatternWatcher, Runner, _build_echo_pattern, _signature_id, _status_show
+from dog.runner import PatternWatcher, Runner, _build_echo_pattern, _signature_id
 from dog.patterns import RETRY_RULES, SUCCESS_PATTERNS, TOOL_RETRY_RULES
 
 
@@ -59,7 +59,6 @@ class FakeChild:
 
 class PatternWatcherTests(unittest.TestCase):
     def setUp(self) -> None:
-        runner_mod._STATUS_VISIBLE = False
         runner_mod._LAST_STATUS_MESSAGE = ""
         self.child = FakeChild(exitstatus=None)
         self.watcher = PatternWatcher(
@@ -233,18 +232,6 @@ class PatternWatcherTests(unittest.TestCase):
         self.assertEqual(visible, b"regular output\n")
         self.assertEqual(self.watcher._buf, "regular output\n")
 
-    def test_feed_clears_transient_status_before_showing_child_output(self) -> None:
-        stderr = io.StringIO()
-        stderr.isatty = lambda: True  # type: ignore[attr-defined]
-
-        with patch("dog.runner.sys.stderr", stderr):
-            _status_show("dog waiting | 29.8s before 'continue'")
-            visible = self.watcher.feed(b"child output\n")
-
-        self.assertEqual(visible, b"child output\n")
-        self.assertTrue(stderr.getvalue().startswith("dog waiting | 29.8s before 'continue'"))
-        self.assertTrue(stderr.getvalue().endswith("\r\033[2K"))
-
     def test_wait_with_progress_cancels_silently_when_user_types_on_tty(self) -> None:
         stderr = io.StringIO()
         stderr.isatty = lambda: True  # type: ignore[attr-defined]
@@ -262,7 +249,21 @@ class PatternWatcherTests(unittest.TestCase):
             )
 
         self.assertFalse(cancelled)
-        self.assertNotIn("local input detected", stderr.getvalue())
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_do_retry_logs_single_line_without_terminal_rewrite_codes(self) -> None:
+        stderr = io.StringIO()
+        stderr.isatty = lambda: True  # type: ignore[attr-defined]
+        rule = {"label": "Codex 429 Too Many Requests", "response": "continue\r", "delay": 30.0}
+
+        with (
+            patch("dog.runner.sys.stderr", stderr),
+            patch.object(self.watcher, "_wait_with_progress", return_value=True),
+        ):
+            self.watcher._do_retry(rule, "429 too many requests")
+
+        self.assertIn("dog retry 1/2: Codex 429 Too Many Requests; sending 'continue' in 30.0s", stderr.getvalue())
+        self.assertNotIn("\r\033[2K", stderr.getvalue())
 
 
 class RunnerTests(unittest.TestCase):
@@ -343,6 +344,45 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(child.sent, ["continue\r"])
         self.assertTrue(child.wait_called)
+
+    @patch("dog.runner.console.print")
+    @patch("dog.runner.signal.signal")
+    @patch("dog.runner.signal.getsignal", return_value=signal.SIG_DFL)
+    @patch("dog.runner.pexpect.spawn")
+    def test_run_restarts_command_when_retryable_failure_exits_child(
+        self,
+        spawn_mock,
+        _getsignal,
+        _signal,
+        _print,
+    ) -> None:
+        first = FakeChild(
+            exitstatus=1,
+            interact_output=b"retryable failure",
+        )
+        second = FakeChild(
+            exitstatus=0,
+            interact_output=b"hello from child",
+        )
+        spawn_mock.side_effect = [first, second]
+
+        exit_code = Runner(
+            "codex",
+            max_retries=2,
+            extra_rules=[{
+                "label": "test retry",
+                "pattern": r"retryable failure",
+                "response": "continue\r",
+                "delay": 0.05,
+                "priority": 1,
+            }],
+        ).run()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(spawn_mock.call_count, 2)
+        self.assertEqual(first.sent, [])
+        self.assertTrue(first.wait_called)
+        self.assertTrue(second.wait_called)
 
     @patch("dog.runner.console.print")
     @patch(

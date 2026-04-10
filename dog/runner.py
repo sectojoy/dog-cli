@@ -239,6 +239,10 @@ class PatternWatcher:
                 return False
         return getattr(self._child, "exitstatus", None) is None
 
+    def _user_is_typing(self) -> bool:
+        with self._lock:
+            return bool(self._input_buf.strip())
+
     def _match(self, text: str, patterns: list) -> Optional[tuple[dict, str]]:
         for pat, rule in patterns:
             match = pat.search(text)
@@ -269,6 +273,8 @@ class PatternWatcher:
             )
         )
         if not self._wait_for_delay(delay):
+            return
+        if self._user_is_typing():
             return
         self._safe_send(response)
         with self._lock:
@@ -312,6 +318,8 @@ class PatternWatcher:
             )
         )
         if not self._wait_for_delay(delay):
+            return
+        if self._user_is_typing():
             return
         self._safe_send(response)
         with self._lock:

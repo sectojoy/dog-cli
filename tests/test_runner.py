@@ -3,11 +3,13 @@ import signal
 import threading
 import time
 import unittest
+import io
 from unittest.mock import patch
 
 import pexpect
 
-from dog.runner import PatternWatcher, Runner, _build_echo_pattern, _signature_id
+import dog.runner as runner_mod
+from dog.runner import PatternWatcher, Runner, _build_echo_pattern, _signature_id, _status_show
 from dog.patterns import RETRY_RULES, SUCCESS_PATTERNS, TOOL_RETRY_RULES
 
 
@@ -57,6 +59,8 @@ class FakeChild:
 
 class PatternWatcherTests(unittest.TestCase):
     def setUp(self) -> None:
+        runner_mod._STATUS_VISIBLE = False
+        runner_mod._LAST_STATUS_MESSAGE = ""
         self.child = FakeChild(exitstatus=None)
         self.watcher = PatternWatcher(
             child=self.child,
@@ -228,6 +232,37 @@ class PatternWatcherTests(unittest.TestCase):
 
         self.assertEqual(visible, b"regular output\n")
         self.assertEqual(self.watcher._buf, "regular output\n")
+
+    def test_feed_clears_transient_status_before_showing_child_output(self) -> None:
+        stderr = io.StringIO()
+        stderr.isatty = lambda: True  # type: ignore[attr-defined]
+
+        with patch("dog.runner.sys.stderr", stderr):
+            _status_show("dog waiting | 29.8s before 'continue'")
+            visible = self.watcher.feed(b"child output\n")
+
+        self.assertEqual(visible, b"child output\n")
+        self.assertTrue(stderr.getvalue().startswith("dog waiting | 29.8s before 'continue'"))
+        self.assertTrue(stderr.getvalue().endswith("\r\033[2K"))
+
+    def test_wait_with_progress_cancels_silently_when_user_types_on_tty(self) -> None:
+        stderr = io.StringIO()
+        stderr.isatty = lambda: True  # type: ignore[attr-defined]
+        self.watcher._input_buf = "d"
+
+        with (
+            patch("dog.runner.sys.stderr", stderr),
+            patch("dog.runner.time.monotonic", side_effect=[0.0, 0.1]),
+        ):
+            cancelled = self.watcher._wait_with_progress(
+                1.0,
+                response="continue\r",
+                label="Codex 429 Too Many Requests",
+                retry_count=1,
+            )
+
+        self.assertFalse(cancelled)
+        self.assertNotIn("local input detected", stderr.getvalue())
 
 
 class RunnerTests(unittest.TestCase):

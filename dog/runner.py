@@ -48,6 +48,8 @@ from dog.patterns import (
 console = Console(stderr=True)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _STATUS_LOCK = threading.Lock()
+_STATUS_VISIBLE = False
+_LAST_STATUS_MESSAGE = ""
 
 
 def _compile(patterns: list[str]) -> re.Pattern:
@@ -78,21 +80,46 @@ def _build_echo_pattern(command: str) -> Optional[re.Pattern]:
 
 
 def _status_write(message: str = "", *, newline: bool = False, clear: bool = False) -> None:
+    global _STATUS_VISIBLE, _LAST_STATUS_MESSAGE
     with _STATUS_LOCK:
         if sys.stderr.isatty():
-            if clear:
+            if clear or _STATUS_VISIBLE:
                 sys.stderr.write("\r\033[2K")
             if message:
                 sys.stderr.write(message)
+                _STATUS_VISIBLE = not newline
+                _LAST_STATUS_MESSAGE = message
+            elif clear:
+                _STATUS_VISIBLE = False
+                _LAST_STATUS_MESSAGE = ""
             if newline:
                 sys.stderr.write("\n")
+                _STATUS_VISIBLE = False
+                _LAST_STATUS_MESSAGE = ""
         else:
             if clear and not message and not newline:
                 return
-            sys.stderr.write(message)
+            if message and message == _LAST_STATUS_MESSAGE and not newline:
+                return
+            if message:
+                sys.stderr.write(message)
             if newline or message:
                 sys.stderr.write("\n")
+            _STATUS_VISIBLE = False
+            _LAST_STATUS_MESSAGE = message if not newline else ""
         sys.stderr.flush()
+
+
+def _status_clear() -> None:
+    _status_write(clear=True)
+
+
+def _status_show(message: str) -> None:
+    _status_write(message)
+
+
+def _status_log(message: str) -> None:
+    _status_write(message, newline=True, clear=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -144,6 +171,8 @@ class PatternWatcher:
     def feed(self, data: bytes) -> bytes:
         text = data.decode("utf-8", errors="replace")
         visible_text = self._suppress_auto_echo(text)
+        if visible_text:
+            _status_clear()
         with self._lock:
             self._buf += visible_text
             if len(self._buf) > 8192:
@@ -226,6 +255,7 @@ class PatternWatcher:
 
             # 1. Fatal
             if self._fatal_re.search(buf):
+                _status_clear()
                 console.print(
                     "\n[bold red]💀 dog: FATAL error — aborting (no retry).[/]"
                 )
@@ -239,6 +269,7 @@ class PatternWatcher:
             if self._success_re.search(buf) and not self._success_seen:
                 self._success_seen = True
                 self._retry_counts = {}
+                _status_clear()
                 console.print(
                     "\n[bold green]🎉 dog: task completed — "
                     "waiting for your next input.[/]"
@@ -287,24 +318,24 @@ class PatternWatcher:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                _status_write(clear=True)
+                _status_clear()
                 return True
             if self._stop_event.wait(min(0.2, remaining)):
-                _status_write(clear=True)
+                _status_clear()
                 return False
             if self._user_is_typing():
-                _status_write("\rdog auto-retry cancelled: local input detected", clear=True, newline=True)
+                if not sys.stderr.isatty():
+                    _status_log("dog auto-retry cancelled: local input detected")
+                else:
+                    _status_clear()
                 return False
             frame = next(spinner)
             message = (
-                f"\r\033[2Kdog waiting {frame} {remaining:4.1f}s "
-                f"before {response_preview} ({label}, {retry_count}/{self._max_retries})"
-            ) if sys.stderr.isatty() else (
-                f"dog waiting {remaining:4.1f}s before {response_preview} "
+                f"dog waiting {frame} {remaining:4.1f}s before {response_preview} "
                 f"({label}, {retry_count}/{self._max_retries})"
             )
             if message != last_rendered:
-                _status_write(message)
+                _status_show(message)
                 last_rendered = message
 
     def _child_is_alive(self) -> bool:
@@ -345,14 +376,14 @@ class PatternWatcher:
             label    = rule.get("label", "permission")
             response = rule.get("response", "y\n")
 
-            _status_write(
-                f"\ndog auto-approve: {label} -> {repr(response.strip()) or '<Enter>'}",
-                newline=True,
-            )
+            if delay <= 0 and not sys.stderr.isatty():
+                _status_log(
+                    f"dog auto-approve: {label} -> {repr(response.strip()) or '<Enter>'}"
+                )
             if not self._wait_with_progress(delay, response=response, label=label, retry_count=1):
                 return
             self._safe_send(response)
-            _status_write(clear=True)
+            _status_clear()
             with self._lock:
                 self._buf = ""
                 self._last_triggered_at[_signature_id(label, matched_text)] = time.monotonic()
@@ -369,11 +400,11 @@ class PatternWatcher:
             self._idle_event.clear()
         try:
             label = rule.get("label", "error")
-            signature = _normalize_signature(matched_text)
             signature_id = _signature_id(label, matched_text)
             retry_count = self._retry_counts.get(signature_id, 0)
 
             if retry_count >= self._max_retries:
+                _status_clear()
                 console.print(
                     "\n[bold red]dog: max retries (%d) reached for failure sig %s — giving up.[/]"
                     % (self._max_retries, signature_id)
@@ -389,13 +420,11 @@ class PatternWatcher:
             delay    = rule.get("delay", 1.0)
             response = rule.get("response", "retry\n")
 
-            _status_write(
-                (
-                    f"\ndog retry {retry_count}/{self._max_retries}: {label}; "
-                    f"sending {repr(response.strip()) or '<Enter>'} in {delay:.1f}s"
-                ),
-                newline=True,
-            )
+            if delay <= 0 and not sys.stderr.isatty():
+                _status_log(
+                    f"dog retry {retry_count}/{self._max_retries}: {label}; "
+                    f"sending {repr(response.strip()) or '<Enter>'} now"
+                )
             if not self._wait_with_progress(
                 delay,
                 response=response,
@@ -404,7 +433,7 @@ class PatternWatcher:
             ):
                 return
             self._safe_send(response)
-            _status_write(clear=True)
+            _status_clear()
             with self._lock:
                 self._buf = ""
                 self._last_triggered_at[signature_id] = time.monotonic()
@@ -425,6 +454,7 @@ class PatternWatcher:
                     self._pending_echo_suppression.append((pattern, time.monotonic() + 2.5))
             self._child.send(text)
         except pexpect.exceptions.ExceptionPexpect as e:
+            _status_clear()
             console.print(f"[red]dog: send failed:[/] {e}")
 
 
@@ -569,6 +599,7 @@ class Runner:
             pass
         code = self._child.exitstatus if self._child.exitstatus is not None else 0
 
+        _status_clear()
         if code == 0 or self._watcher._success_seen:
             console.print("\n[bold green]✓ dog: session finished cleanly.[/]")
         else:

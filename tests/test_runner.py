@@ -17,6 +17,7 @@ class FakeChild:
         exitstatus: int | None = 0,
         interact_output: bytes = b"hello from child",
         interact_delay: float = 0.0,
+        preserve_exitstatus_after_interact: bool = False,
     ) -> None:
         self.exitstatus = exitstatus
         self.sent: list[str] = []
@@ -26,6 +27,7 @@ class FakeChild:
         self.window_size: tuple[int, int] | None = None
         self.interact_output = interact_output
         self.interact_delay = interact_delay
+        self.preserve_exitstatus_after_interact = preserve_exitstatus_after_interact
 
     def send(self, text: str) -> None:
         self.sent.append(text)
@@ -40,7 +42,7 @@ class FakeChild:
             self.filtered_output = output_filter(self.interact_output)
         if self.interact_delay:
             time.sleep(self.interact_delay)
-        if self.exitstatus is None:
+        if self.exitstatus is None and not self.preserve_exitstatus_after_interact:
             self.exitstatus = 0
 
     def wait(self) -> None:
@@ -181,8 +183,6 @@ class PatternWatcherTests(unittest.TestCase):
         self.watcher._do_retry(rule, "timeout error")
 
         self.assertEqual(sorted(self.watcher._retry_counts.values()), [1, 2])
-        rendered = "".join(str(call.args[0]) for call in print_mock.call_args_list)
-        self.assertIn("sig", rendered)
 
     def test_match_allows_same_signature_again_after_cooldown(self) -> None:
         rule = {"response": "continue\r", "label": "codex", "delay": 1.0}
@@ -278,7 +278,7 @@ class RunnerTests(unittest.TestCase):
     @patch("dog.runner.signal.signal")
     @patch("dog.runner.signal.getsignal", return_value=signal.SIG_DFL)
     @patch("dog.runner.pexpect.spawn")
-    def test_run_stops_watcher_before_pending_retry_can_send(
+    def test_run_waits_for_pending_retry_before_stopping_watcher(
         self,
         spawn_mock,
         _getsignal,
@@ -289,13 +289,24 @@ class RunnerTests(unittest.TestCase):
             exitstatus=None,
             interact_output=b"stream disconnected before completion",
             interact_delay=0.05,
+            preserve_exitstatus_after_interact=True,
         )
         spawn_mock.return_value = child
 
-        exit_code = Runner("codex", max_retries=2).run()
+        exit_code = Runner(
+            "codex",
+            max_retries=2,
+            extra_rules=[{
+                "label": "test retry",
+                "pattern": r"stream disconnected before completion",
+                "response": "continue\r",
+                "delay": 0.05,
+                "priority": 1,
+            }],
+        ).run()
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(child.sent, [])
+        self.assertEqual(child.sent, ["continue\r"])
         self.assertTrue(child.wait_called)
 
     @patch("dog.runner.console.print")

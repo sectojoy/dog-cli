@@ -31,11 +31,11 @@ import sys
 import time
 import threading
 import hashlib
+import itertools
 from typing import Optional
 
 import pexpect
 from rich.console import Console
-from rich.text import Text
 
 from dog.patterns import (
     COMMON_RETRY_RULES,
@@ -47,6 +47,7 @@ from dog.patterns import (
 
 console = Console(stderr=True)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_STATUS_LOCK = threading.Lock()
 
 
 def _compile(patterns: list[str]) -> re.Pattern:
@@ -74,6 +75,24 @@ def _build_echo_pattern(command: str) -> Optional[re.Pattern]:
         rf"(^|[\r\n])[ \t]*(?:[›>][ \t]*)?{escaped}(?=($|[\r\n]))",
         re.IGNORECASE,
     )
+
+
+def _status_write(message: str = "", *, newline: bool = False, clear: bool = False) -> None:
+    with _STATUS_LOCK:
+        if sys.stderr.isatty():
+            if clear:
+                sys.stderr.write("\r\033[2K")
+            if message:
+                sys.stderr.write(message)
+            if newline:
+                sys.stderr.write("\n")
+        else:
+            if clear and not message and not newline:
+                return
+            sys.stderr.write(message)
+            if newline or message:
+                sys.stderr.write("\n")
+        sys.stderr.flush()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -114,6 +133,9 @@ class PatternWatcher:
         self._input_buf = ""
         self._last_triggered_at: dict[str, float] = {}
         self._pending_echo_suppression: list[tuple[re.Pattern, float]] = []
+        self._active_actions = 0
+        self._idle_event = threading.Event()
+        self._idle_event.set()
         # Prevent rapid re-firing on the same chunk
         self._last_action_time = 0.0
 
@@ -132,6 +154,24 @@ class PatternWatcher:
     def stop(self) -> None:
         self._stop_event.set()
         self._notify.set()
+
+    def wait_for_idle(self, start_timeout: float = 0.25, finish_timeout: float = 0.0) -> bool:
+        deadline = time.monotonic() + max(start_timeout, 0.0)
+        while time.monotonic() < deadline:
+            with self._lock:
+                active_actions = self._active_actions
+                notify_pending = self._notify.is_set()
+            if active_actions > 0:
+                return self._idle_event.wait(timeout=max(finish_timeout, 0.0))
+            if not notify_pending:
+                return True
+            time.sleep(0.01)
+
+        with self._lock:
+            active_actions = self._active_actions
+        if active_actions > 0:
+            return self._idle_event.wait(timeout=max(finish_timeout, 0.0))
+        return True
 
     def _suppress_auto_echo(self, text: str) -> str:
         now = time.monotonic()
@@ -227,8 +267,45 @@ class PatternWatcher:
                 self._success_seen = False
                 self._do_retry(rule, matched[1])
 
-    def _wait_for_delay(self, delay: float) -> bool:
-        return not self._stop_event.wait(max(delay, 0.0))
+    def _wait_with_progress(
+        self,
+        delay: float,
+        *,
+        response: str,
+        label: str,
+        retry_count: int,
+    ) -> bool:
+        delay = max(float(delay), 0.0)
+        if delay <= 0:
+            return True
+
+        response_preview = repr(response.strip()) or "<Enter>"
+        spinner = itertools.cycle("|/-\\")
+        deadline = time.monotonic() + delay
+        last_rendered = None
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _status_write(clear=True)
+                return True
+            if self._stop_event.wait(min(0.2, remaining)):
+                _status_write(clear=True)
+                return False
+            if self._user_is_typing():
+                _status_write("\rdog auto-retry cancelled: local input detected", clear=True, newline=True)
+                return False
+            frame = next(spinner)
+            message = (
+                f"\r\033[2Kdog waiting {frame} {remaining:4.1f}s "
+                f"before {response_preview} ({label}, {retry_count}/{self._max_retries})"
+            ) if sys.stderr.isatty() else (
+                f"dog waiting {remaining:4.1f}s before {response_preview} "
+                f"({label}, {retry_count}/{self._max_retries})"
+            )
+            if message != last_rendered:
+                _status_write(message)
+                last_rendered = message
 
     def _child_is_alive(self) -> bool:
         isalive = getattr(self._child, "isalive", None)
@@ -259,73 +336,84 @@ class PatternWatcher:
         return None
 
     def _do_permission(self, rule: dict, matched_text: str) -> None:
-        self._retry_counts = {}
-        delay    = rule.get("delay", 0.3)
-        label    = rule.get("label", "permission")
-        response = rule.get("response", "y\n")
-
-        console.print(
-            Text.assemble(
-                "\n[bold blue]🔑 dog:[/] ",
-                ("auto-approve", "bold blue"),
-                f"  ({label})  →  ",
-                (repr(response.strip()) or "<Enter>", "cyan"),
-            )
-        )
-        if not self._wait_for_delay(delay):
-            return
-        if self._user_is_typing():
-            return
-        self._safe_send(response)
         with self._lock:
-            self._buf = ""
-            self._last_triggered_at[_signature_id(label, matched_text)] = time.monotonic()
-        self._last_action_time = time.monotonic()
+            self._active_actions += 1
+            self._idle_event.clear()
+        try:
+            self._retry_counts = {}
+            delay    = rule.get("delay", 0.3)
+            label    = rule.get("label", "permission")
+            response = rule.get("response", "y\n")
+
+            _status_write(
+                f"\ndog auto-approve: {label} -> {repr(response.strip()) or '<Enter>'}",
+                newline=True,
+            )
+            if not self._wait_with_progress(delay, response=response, label=label, retry_count=1):
+                return
+            self._safe_send(response)
+            _status_write(clear=True)
+            with self._lock:
+                self._buf = ""
+                self._last_triggered_at[_signature_id(label, matched_text)] = time.monotonic()
+            self._last_action_time = time.monotonic()
+        finally:
+            with self._lock:
+                self._active_actions -= 1
+                if self._active_actions == 0:
+                    self._idle_event.set()
 
     def _do_retry(self, rule: dict, matched_text: str) -> None:
-        label = rule.get("label", "error")
-        signature = _normalize_signature(matched_text)
-        signature_id = _signature_id(label, matched_text)
-        retry_count = self._retry_counts.get(signature_id, 0)
-
-        if retry_count >= self._max_retries:
-            console.print(
-                "\n[bold red]dog: max retries (%d) reached for failure sig %s — giving up.[/]"
-                % (self._max_retries, signature_id)
-            )
-            try:
-                self._child.close(force=True)
-            except Exception:
-                pass
-            os._exit(3)
-
-        retry_count += 1
-        self._retry_counts[signature_id] = retry_count
-        delay    = rule.get("delay", 1.0)
-        response = rule.get("response", "retry\n")
-        signature_preview = signature[:72] if signature else label.lower()
-
-        console.print(
-            Text.assemble(
-                "\n[bold yellow]⚡ dog:[/] ",
-                ("auto-retry", "bold yellow"),
-                f" #{retry_count}/{self._max_retries}  ",
-                (f"({label})", "dim"),
-                f"  [sig {signature_id}]  ",
-                (repr(signature_preview), "dim"),
-                f"  — waiting {delay}s then sending: ",
-                (repr(response.strip()), "cyan"),
-            )
-        )
-        if not self._wait_for_delay(delay):
-            return
-        if self._user_is_typing():
-            return
-        self._safe_send(response)
         with self._lock:
-            self._buf = ""
-            self._last_triggered_at[signature_id] = time.monotonic()
-        self._last_action_time = time.monotonic()
+            self._active_actions += 1
+            self._idle_event.clear()
+        try:
+            label = rule.get("label", "error")
+            signature = _normalize_signature(matched_text)
+            signature_id = _signature_id(label, matched_text)
+            retry_count = self._retry_counts.get(signature_id, 0)
+
+            if retry_count >= self._max_retries:
+                console.print(
+                    "\n[bold red]dog: max retries (%d) reached for failure sig %s — giving up.[/]"
+                    % (self._max_retries, signature_id)
+                )
+                try:
+                    self._child.close(force=True)
+                except Exception:
+                    pass
+                os._exit(3)
+
+            retry_count += 1
+            self._retry_counts[signature_id] = retry_count
+            delay    = rule.get("delay", 1.0)
+            response = rule.get("response", "retry\n")
+
+            _status_write(
+                (
+                    f"\ndog retry {retry_count}/{self._max_retries}: {label}; "
+                    f"sending {repr(response.strip()) or '<Enter>'} in {delay:.1f}s"
+                ),
+                newline=True,
+            )
+            if not self._wait_with_progress(
+                delay,
+                response=response,
+                label=label,
+                retry_count=retry_count,
+            ):
+                return
+            self._safe_send(response)
+            _status_write(clear=True)
+            with self._lock:
+                self._buf = ""
+                self._last_triggered_at[signature_id] = time.monotonic()
+            self._last_action_time = time.monotonic()
+        finally:
+            with self._lock:
+                self._active_actions -= 1
+                if self._active_actions == 0:
+                    self._idle_event.set()
 
     def _safe_send(self, text: str) -> None:
         if self._stop_event.is_set() or not self._child_is_alive():
@@ -465,6 +553,11 @@ class Runner:
         except Exception:
             pass
         finally:
+            if self._watcher is not None:
+                self._watcher.wait_for_idle(
+                    start_timeout=0.35,
+                    finish_timeout=0.0 if not self._child.isalive() else 31.0,
+                )
             self._watcher.stop()
             watcher_thread.join(timeout=1.0)
             signal.signal(signal.SIGWINCH, old_winch)

@@ -82,6 +82,7 @@ class PatternWatcher:
         self._success_seen = False
         self._stop     = False
         self._input_buf = ""
+        self._last_trigger: Optional[tuple[str, str]] = None
         # Prevent rapid re-firing on the same chunk
         self._last_action_time = 0.0
 
@@ -108,6 +109,7 @@ class PatternWatcher:
                     if self._input_buf.strip():
                         self._success_seen = False
                         self._buf = ""
+                        self._last_trigger = None
                     self._input_buf = ""
                 elif ch in ("\x7f", "\b"):
                     self._input_buf = self._input_buf[:-1]
@@ -154,6 +156,7 @@ class PatternWatcher:
                 )
                 with self._lock:
                     self._buf = ""
+                    self._last_trigger = None
                 self._last_action_time = time.monotonic()
                 continue
 
@@ -162,24 +165,32 @@ class PatternWatcher:
 
             # 3. Permission auto-approve
             if self._auto_permission:
-                rule = self._match(buf, self._perm_patterns)
+                matched = self._match(buf, self._perm_patterns)
+                rule = matched[0] if matched else None
                 if rule:
-                    self._do_permission(rule)
+                    self._do_permission(rule, matched[1])
                     continue
 
             # 4. Retry
-            rule = self._match(buf, self._rule_patterns)
+            matched = self._match(buf, self._rule_patterns)
+            rule = matched[0] if matched else None
             if rule:
                 self._success_seen = False
-                self._do_retry(rule)
+                self._do_retry(rule, matched[1])
 
-    def _match(self, text: str, patterns: list) -> Optional[dict]:
+    def _match(self, text: str, patterns: list) -> Optional[tuple[dict, str]]:
         for pat, rule in patterns:
-            if pat.search(text):
-                return rule
+            match = pat.search(text)
+            if not match:
+                continue
+            matched_text = match.group(0).strip().lower()
+            trigger = (rule.get("label", "pattern"), matched_text)
+            if trigger == self._last_trigger:
+                return None
+            return rule, matched_text
         return None
 
-    def _do_permission(self, rule: dict) -> None:
+    def _do_permission(self, rule: dict, matched_text: str) -> None:
         self._retries = 0
         delay    = rule.get("delay", 0.3)
         label    = rule.get("label", "permission")
@@ -197,9 +208,10 @@ class PatternWatcher:
         self._safe_send(response)
         with self._lock:
             self._buf = ""
+            self._last_trigger = (label, matched_text)
         self._last_action_time = time.monotonic()
 
-    def _do_retry(self, rule: dict) -> None:
+    def _do_retry(self, rule: dict, matched_text: str) -> None:
         if self._retries >= self._max_retries:
             console.print(
                 f"\n[bold red]dog: max retries ({self._max_retries}) reached — giving up.[/]"
@@ -229,6 +241,7 @@ class PatternWatcher:
         self._safe_send(response)
         with self._lock:
             self._buf = ""
+            self._last_trigger = (label, matched_text)
         self._last_action_time = time.monotonic()
 
     def _safe_send(self, text: str) -> None:

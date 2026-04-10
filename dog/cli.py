@@ -9,6 +9,9 @@ dog claude -- --model claude-opus-4-5 --prompt "refactor main.py"
 # Wrap Codex
 dog codex -- --full-auto "write unit tests for utils.py"
 
+# Wrap Opencode
+dog opencode run "write unit tests for utils.py"
+
 # Wrap any arbitrary command
 dog run --max-retries 5 -- npx claude-code --model opus
 
@@ -98,7 +101,7 @@ def _build_extra_rules(retry_on: tuple[str, ...], retry_cmd: str) -> list[dict]:
 )
 @click.version_option(__version__, "-V", "--version")
 def main() -> None:
-    """🐕 dog — resilient wrapper for Claude Code, Codex, and other AI CLIs.
+    """🐕 dog — resilient wrapper for Claude Code, Codex, Opencode, and other AI CLIs.
 
     Automatically retries on API errors, timeouts, and certificate failures
     while transparently forwarding your keystrokes for normal interaction.
@@ -166,6 +169,38 @@ def cmd_codex(
     """
     extra_args = " ".join(shlex.quote(a) for a in args)
     command = f"codex {extra_args}".strip()
+    _run(command, max_retries, timeout, no_echo, retry_on, retry_cmd, not no_auto_permission)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# dog opencode [args...]
+# ──────────────────────────────────────────────────────────────────────────────
+@main.command(
+    name="opencode",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+@click.argument("args", nargs=-1, type=click.UNPROCESSED)
+@_add_shared
+def cmd_opencode(
+    args: tuple[str, ...],
+    max_retries: int,
+    timeout: float,
+    no_echo: bool,
+    retry_on: tuple[str, ...],
+    retry_cmd: str,
+    no_auto_permission: bool,
+) -> None:
+    """Wrap **opencode** with auto-retry.
+
+    All unrecognised flags are passed directly to `opencode`.
+
+    \b
+    Examples:
+      dog opencode run "write tests for utils.py"
+      dog opencode -r 5 -- run --continue --model openai/gpt-5 "refactor auth module"
+    """
+    extra_args = " ".join(shlex.quote(a) for a in args)
+    command = f"opencode {extra_args}".strip()
     _run(command, max_retries, timeout, no_echo, retry_on, retry_cmd, not no_auto_permission)
 
 

@@ -81,3 +81,32 @@ class CliCommandTests(unittest.TestCase):
             "continue",
             True,
         )
+
+    @patch("dog.cli._run")
+    def test_opencode_forwards_arguments_and_flags(self, run_mock) -> None:
+        result = self.runner.invoke(
+            main,
+            [
+                "opencode",
+                "-r",
+                "7",
+                "--retry-on",
+                "stream disconnected",
+                "run",
+                "--continue",
+                "--model",
+                "openai/gpt-5",
+                "fix flaky tests",
+            ],
+        )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        run_mock.assert_called_once_with(
+            "opencode run --continue --model openai/gpt-5 'fix flaky tests'",
+            7,
+            30.0,
+            False,
+            ("stream disconnected",),
+            "continue",
+            True,
+        )

@@ -56,7 +56,7 @@ class PatternWatcherTests(unittest.TestCase):
         rule = {"label": "network", "response": "retry\r", "delay": 0}
         self.watcher._buf = "retry me"
 
-        self.watcher._do_retry(rule)
+        self.watcher._do_retry(rule, "network error")
 
         self.assertEqual(self.child.sent, ["retry\r"])
         self.assertEqual(self.watcher._retries, 1)
@@ -68,7 +68,7 @@ class PatternWatcherTests(unittest.TestCase):
         rule = {"label": "approve", "response": "y\r", "delay": 0}
         self.watcher._retries = 2
 
-        self.watcher._do_permission(rule)
+        self.watcher._do_permission(rule, "approve prompt")
 
         self.assertEqual(self.child.sent, ["y\r"])
         self.assertEqual(self.watcher._retries, 0)
@@ -80,7 +80,7 @@ class PatternWatcherTests(unittest.TestCase):
         self.watcher._retries = 2
 
         with self.assertRaises(SystemExit) as ctx:
-            self.watcher._do_retry({"label": "network", "response": "retry\r", "delay": 0})
+            self.watcher._do_retry({"label": "network", "response": "retry\r", "delay": 0}, "network error")
 
         self.assertEqual(ctx.exception.code, 3)
         self.assertTrue(self.child.closed)
@@ -110,6 +110,22 @@ class PatternWatcherTests(unittest.TestCase):
         self.assertIsNotNone(rule)
         self.assertTrue(self.watcher._success_seen)
         self.assertEqual(self.child.sent, [])
+
+    def test_match_skips_same_trigger_until_state_resets(self) -> None:
+        self.watcher._rule_patterns = [
+            (re.compile(r"network error", re.IGNORECASE), {"response": "continue\r", "label": "codex"})
+        ]
+
+        first = self.watcher._match("network error", self.watcher._rule_patterns)
+        self.assertIsNotNone(first)
+        self.watcher._last_trigger = ("codex", "network error")
+
+        second = self.watcher._match("network error", self.watcher._rule_patterns)
+        self.assertIsNone(second)
+
+        self.watcher.note_user_input(b"new task\r")
+        third = self.watcher._match("network error", self.watcher._rule_patterns)
+        self.assertIsNotNone(third)
 
 
 class RunnerTests(unittest.TestCase):

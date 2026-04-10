@@ -18,6 +18,7 @@ class FakeChild:
         self,
         exitstatus: int | None = 0,
         interact_output: bytes = b"hello from child",
+        tail_output: bytes = b"",
         interact_delay: float = 0.0,
         preserve_exitstatus_after_interact: bool = False,
     ) -> None:
@@ -28,6 +29,7 @@ class FakeChild:
         self.filtered_output: bytes | None = None
         self.window_size: tuple[int, int] | None = None
         self.interact_output = interact_output
+        self.tail_output = tail_output
         self.interact_delay = interact_delay
         self.preserve_exitstatus_after_interact = preserve_exitstatus_after_interact
 
@@ -55,6 +57,22 @@ class FakeChild:
 
     def isalive(self) -> bool:
         return self.exitstatus is None
+
+    def read_nonblocking(self, size: int = 1, timeout: int | float = 0) -> bytes:
+        if self.tail_output:
+            chunk = self.tail_output[:size]
+            self.tail_output = self.tail_output[size:]
+            return chunk
+        raise pexpect.exceptions.TIMEOUT("no more buffered output")
+
+
+class FakeTTYStream(io.StringIO):
+    def __init__(self) -> None:
+        super().__init__()
+        self.buffer = io.BytesIO()
+
+    def isatty(self) -> bool:
+        return True
 
 
 class PatternWatcherTests(unittest.TestCase):
@@ -251,9 +269,25 @@ class PatternWatcherTests(unittest.TestCase):
         self.assertFalse(cancelled)
         self.assertEqual(stderr.getvalue(), "")
 
+    def test_wait_for_idle_waits_for_pending_notify_to_drain(self) -> None:
+        self.watcher._notify.set()
+
+        def clear_pending() -> None:
+            time.sleep(0.05)
+            self.watcher._notify.clear()
+
+        thread = threading.Thread(target=clear_pending)
+        thread.start()
+        try:
+            drained = self.watcher.wait_for_idle(start_timeout=0.01, finish_timeout=0.20)
+        finally:
+            thread.join(timeout=1.0)
+
+        self.assertTrue(drained)
+
     def test_do_retry_logs_single_line_without_terminal_rewrite_codes(self) -> None:
         stderr = io.StringIO()
-        stderr.isatty = lambda: True  # type: ignore[attr-defined]
+        stderr.isatty = lambda: False  # type: ignore[attr-defined]
         rule = {"label": "Codex 429 Too Many Requests", "response": "continue\r", "delay": 30.0}
 
         with (
@@ -264,6 +298,21 @@ class PatternWatcherTests(unittest.TestCase):
 
         self.assertIn("dog retry 1/2: Codex 429 Too Many Requests; sending 'continue' in 30.0s", stderr.getvalue())
         self.assertNotIn("\r\033[2K", stderr.getvalue())
+
+    def test_do_retry_stays_silent_on_interactive_tty(self) -> None:
+        stdout = FakeTTYStream()
+        stderr = FakeTTYStream()
+        rule = {"label": "Codex 429 Too Many Requests", "response": "continue\r", "delay": 30.0}
+
+        with (
+            patch("dog.runner.sys.stdout", stdout),
+            patch("dog.runner.sys.stderr", stderr),
+            patch.object(self.watcher, "_wait_with_progress", return_value=True),
+        ):
+            self.watcher._do_retry(rule, "429 too many requests")
+
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(stdout.getvalue(), "")
 
 
 class RunnerTests(unittest.TestCase):
@@ -385,6 +434,81 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(second.wait_called)
 
     @patch("dog.runner.console.print")
+    @patch("dog.runner.signal.signal")
+    @patch("dog.runner.signal.getsignal", return_value=signal.SIG_DFL)
+    @patch("dog.runner.pexpect.spawn")
+    def test_run_processes_final_retryable_output_even_when_watcher_is_late(
+        self,
+        spawn_mock,
+        _getsignal,
+        _signal,
+        _print,
+    ) -> None:
+        first = FakeChild(
+            exitstatus=1,
+            interact_output=b"retryable failure",
+        )
+        second = FakeChild(
+            exitstatus=0,
+            interact_output=b"hello from child",
+        )
+        spawn_mock.side_effect = [first, second]
+
+        original_run = PatternWatcher.run
+
+        def delayed_run(watcher_self) -> None:
+            if watcher_self._child is first:
+                time.sleep(0.5)
+            return original_run(watcher_self)
+
+        with patch("dog.runner.PatternWatcher.run", new=delayed_run):
+            exit_code = Runner(
+                "codex",
+                max_retries=2,
+                extra_rules=[{
+                    "label": "test retry",
+                    "pattern": r"retryable failure",
+                    "response": "continue\r",
+                    "delay": 0.0,
+                    "priority": 1,
+                }],
+            ).run()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(spawn_mock.call_count, 2)
+
+    @patch("dog.runner.console.print")
+    @patch("dog.runner.signal.signal")
+    @patch("dog.runner.signal.getsignal", return_value=signal.SIG_DFL)
+    @patch("dog.runner.pexpect.spawn")
+    def test_run_retries_when_429_only_arrives_in_tail_output(
+        self,
+        spawn_mock,
+        _getsignal,
+        _signal,
+        _print,
+    ) -> None:
+        first = FakeChild(
+            exitstatus=1,
+            interact_output=b"",
+            tail_output=b"exceeded retry limit, last status: 429 Too Many Requests\n",
+        )
+        second = FakeChild(
+            exitstatus=0,
+            interact_output=b"hello from child",
+        )
+        spawn_mock.side_effect = [first, second]
+
+        exit_code = Runner(
+            "codex",
+            max_retries=2,
+            profile="codex",
+        ).run()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(spawn_mock.call_count, 2)
+
+    @patch("dog.runner.console.print")
     @patch(
         "dog.runner.pexpect.spawn",
         side_effect=pexpect.exceptions.ExceptionPexpect("boom"),
@@ -393,6 +517,32 @@ class RunnerTests(unittest.TestCase):
         exit_code = Runner("missing-command").run()
 
         self.assertEqual(exit_code, 1)
+
+    def test_drain_pending_output_skips_terminal_echo_on_interactive_tty(self) -> None:
+        child = FakeChild(exitstatus=1, tail_output=b"tail fragment\n")
+        runner = Runner("echo hello")
+        runner._child = child
+        runner._watcher = PatternWatcher(
+            child=child,
+            rule_patterns=[],
+            permission_patterns=[],
+            fatal_re=re.compile(r"fatal"),
+            success_re=re.compile(r"done"),
+            max_retries=2,
+            auto_permission=True,
+        )
+        stdout = FakeTTYStream()
+        stderr = FakeTTYStream()
+
+        with (
+            patch("dog.runner.sys.stdout", stdout),
+            patch("dog.runner.sys.stderr", stderr),
+        ):
+            runner._drain_pending_output(runner._watcher.feed)
+
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stdout.buffer.getvalue(), b"")
+        self.assertIn("tail fragment", runner._watcher._buf)
 
 
 class PatternRulesTests(unittest.TestCase):

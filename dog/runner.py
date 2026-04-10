@@ -25,6 +25,7 @@ Signal handling
 from __future__ import annotations
 
 import os
+import errno
 import re
 import signal
 import sys
@@ -48,6 +49,12 @@ console = Console(stderr=True)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _STATUS_LOCK = threading.Lock()
 _LAST_STATUS_MESSAGE = ""
+
+
+def _interactive_tty() -> bool:
+    stdout_tty = getattr(sys.stdout, "isatty", lambda: False)()
+    stderr_tty = getattr(sys.stderr, "isatty", lambda: False)()
+    return bool(stdout_tty and stderr_tty)
 
 
 def _compile(patterns: list[str]) -> re.Pattern:
@@ -80,6 +87,8 @@ def _build_echo_pattern(command: str) -> Optional[re.Pattern]:
 def _status_write(message: str = "", *, newline: bool = False, clear: bool = False) -> None:
     global _LAST_STATUS_MESSAGE
     with _STATUS_LOCK:
+        if _interactive_tty():
+            return
         if clear and not message and not newline:
             return
         if message and message == _LAST_STATUS_MESSAGE:
@@ -173,22 +182,25 @@ class PatternWatcher:
             return request
 
     def wait_for_idle(self, start_timeout: float = 0.25, finish_timeout: float = 0.0) -> bool:
-        deadline = time.monotonic() + max(start_timeout, 0.0)
-        while time.monotonic() < deadline:
+        timeout = max(start_timeout, 0.0) + max(finish_timeout, 0.0)
+        deadline = time.monotonic() + timeout
+
+        while True:
             with self._lock:
                 active_actions = self._active_actions
                 notify_pending = self._notify.is_set()
-            if active_actions > 0:
-                return self._idle_event.wait(timeout=max(finish_timeout, 0.0))
-            if not notify_pending:
-                return True
-            time.sleep(0.01)
 
-        with self._lock:
-            active_actions = self._active_actions
-        if active_actions > 0:
-            return self._idle_event.wait(timeout=max(finish_timeout, 0.0))
-        return True
+            if active_actions == 0 and not notify_pending:
+                return True
+
+            if time.monotonic() >= deadline:
+                return False
+
+            if active_actions > 0:
+                remaining = max(deadline - time.monotonic(), 0.0)
+                self._idle_event.wait(timeout=min(remaining, 0.1))
+            else:
+                time.sleep(0.01)
 
     def _suppress_auto_echo(self, text: str) -> str:
         now = time.monotonic()
@@ -564,6 +576,7 @@ class Runner:
             except Exception:
                 pass
             finally:
+                self._drain_pending_output(_output_filter)
                 if self._watcher is not None:
                     self._watcher.wait_for_idle(
                         start_timeout=0.35,
@@ -582,10 +595,11 @@ class Runner:
             restart_request = self._watcher.consume_restart_request() if self._watcher is not None else None
 
             if restart_request:
-                console.print(
-                    "\n[yellow]dog: retryable failure persisted after the tool exited; restarting command "
-                    f"({restart_request['label']}, {restart_request['retry_count']}/{self.max_retries}).[/]"
-                )
+                if not _interactive_tty():
+                    console.print(
+                        "\n[yellow]dog: retryable failure persisted after the tool exited; restarting command "
+                        f"({restart_request['label']}, {restart_request['retry_count']}/{self.max_retries}).[/]"
+                    )
                 continue
 
             if code == 0 or self._watcher._success_seen:
@@ -594,3 +608,30 @@ class Runner:
                 console.print(f"\n[bold red]✗ dog: process exited with code {code}.[/]")
 
             return code
+
+    def _drain_pending_output(self, output_filter) -> None:
+        if self._child is None or self._watcher is None:
+            return
+
+        while True:
+            try:
+                chunk = self._child.read_nonblocking(size=4096, timeout=0)
+            except pexpect.exceptions.TIMEOUT:
+                break
+            except pexpect.exceptions.EOF:
+                break
+            except OSError as exc:
+                if exc.errno in (errno.EIO, errno.EBADF):
+                    break
+                raise
+
+            if not chunk:
+                break
+
+            visible = output_filter(chunk)
+            if self.echo and visible and not _interactive_tty():
+                try:
+                    sys.stdout.buffer.write(visible)
+                except AttributeError:
+                    sys.stdout.write(visible.decode("utf-8", errors="replace"))
+                sys.stdout.flush()

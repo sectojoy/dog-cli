@@ -117,17 +117,35 @@ def _select_highlighted_response(response: str, screen_text: str) -> str:
     return response
 
 
+def _screen_has_input_prompt(screen_text: str) -> bool:
+    normalized_screen = _ANSI_RE.sub("", screen_text)
+    return bool(
+        re.search(
+            r"(?:^|[\r\n])[ \t]*[›❯>][ \t]*[^\r\n]*$",
+            normalized_screen,
+        )
+    )
+
+
+def _infer_profile(command: str, profile: Optional[str]) -> Optional[str]:
+    if profile:
+        return profile
+    first = command.strip().split(maxsplit=1)[0].lower() if command.strip() else ""
+    return first if first in {"claude", "codex", "opencode"} else None
+
+
 def _status_write(message: str = "", *, newline: bool = False, clear: bool = False) -> None:
     global _LAST_STATUS_MESSAGE
     with _STATUS_LOCK:
         if _interactive_tty():
             if clear:
                 sys.stderr.write("\r\033[2K")
-                if newline:
+                if not message and newline:
                     sys.stderr.write("\n")
-                _LAST_STATUS_MESSAGE = ""
-                sys.stderr.flush()
-                return
+                if not message:
+                    _LAST_STATUS_MESSAGE = ""
+                    sys.stderr.flush()
+                    return
             if message and message == _LAST_STATUS_MESSAGE and not newline:
                 return
             sys.stderr.write("\r\033[2K")
@@ -198,6 +216,7 @@ class PatternWatcher:
         success_re: re.Pattern,
         max_retries: int,
         auto_permission: bool,
+        profile: Optional[str] = None,
         retry_counts: Optional[dict[str, int]] = None,
     ) -> None:
         self._child            = child
@@ -207,6 +226,7 @@ class PatternWatcher:
         self._success_re       = success_re
         self._max_retries      = max_retries
         self._auto_permission  = auto_permission
+        self._profile          = profile
 
         self._buf      = ""
         self._lock     = threading.Lock()
@@ -217,6 +237,7 @@ class PatternWatcher:
         self._input_buf = ""
         self._last_triggered_at: dict[str, float] = {}
         self._pending_echo_suppression: list[tuple[re.Pattern, float]] = []
+        self._last_output_at = 0.0
         self._active_actions = 0
         self._idle_event = threading.Event()
         self._idle_event.set()
@@ -233,6 +254,8 @@ class PatternWatcher:
         text = self._output_decoder.decode(visible_bytes, final=False)
         with self._lock:
             self._buf += text
+            if text:
+                self._last_output_at = time.monotonic()
             if len(self._buf) > 8192:
                 self._buf = self._buf[-8192:]
         self._notify.set()
@@ -405,6 +428,76 @@ class PatternWatcher:
                 _status_clear()
                 return False
 
+    def _response_needs_settled_prompt(self, response: str) -> bool:
+        stripped = response.strip().lower()
+        if stripped not in {"retry", "continue"}:
+            return False
+        return self._profile in {"codex", "opencode"}
+
+    def _ready_response_for_profile(self, response: str, screen_text: str) -> tuple[bool, str]:
+        selected = _select_highlighted_response(response, screen_text)
+        if selected == "\r":
+            return True, selected
+        if self._profile in {"codex", "opencode"} and _screen_has_input_prompt(screen_text):
+            return True, selected
+        return False, selected
+
+    def _wait_for_input_prompt(
+        self,
+        response: str,
+        *,
+        action: str,
+        label: str,
+        retry_count: int,
+        timeout: float = 8.0,
+        quiet_period: float = 0.35,
+        stable_period: float = 0.15,
+    ) -> Optional[str]:
+        if not self._response_needs_settled_prompt(response):
+            return response
+
+        deadline = time.monotonic() + max(timeout, 0.0)
+        ready_signature: Optional[str] = None
+        ready_since: Optional[float] = None
+        while True:
+            with self._lock:
+                screen_text = self._buf
+                last_output_at = self._last_output_at
+
+            now = time.monotonic()
+            prompt_ready, selected = self._ready_response_for_profile(response, screen_text)
+            screen_signature = _normalize_signature(screen_text)
+            if prompt_ready:
+                if screen_signature != ready_signature:
+                    ready_signature = screen_signature
+                    ready_since = now
+            else:
+                ready_signature = None
+                ready_since = None
+
+            output_quiet = (now - last_output_at) >= max(quiet_period, 0.0)
+            prompt_stable = ready_since is not None and (now - ready_since) >= max(stable_period, 0.0)
+            if prompt_ready and output_quiet and prompt_stable:
+                _status_clear()
+                return selected
+
+            if now >= deadline:
+                _status_clear()
+                return selected
+            if self._user_is_typing():
+                _status_clear()
+                return None
+            if not self._child_is_alive():
+                return selected
+
+            _status_show(
+                f"dog {action} {retry_count}/{self._max_retries}: {label}; "
+                f"waiting for prompt to settle before sending {repr(response.strip()) or '<Enter>'}"
+            )
+            if self._stop_event.wait(0.1):
+                _status_clear()
+                return None
+
     def _child_is_alive(self) -> bool:
         isalive = getattr(self._child, "isalive", None)
         if callable(isalive):
@@ -507,6 +600,19 @@ class PatternWatcher:
                 retry_count=retry_count,
             ):
                 return
+            if float(delay) > 0 and self._response_needs_settled_prompt(response):
+                response = self._wait_for_input_prompt(
+                    response,
+                    action="retry",
+                    label=label,
+                    retry_count=retry_count,
+                )
+                if response is None:
+                    return
+            else:
+                with self._lock:
+                    screen_text = self._buf
+                response = _select_highlighted_response(response, screen_text)
             if self._child_is_alive():
                 self._safe_send(response)
             else:
@@ -572,10 +678,11 @@ class Runner:
         self.echo           = echo
         self.timeout        = timeout
         self.auto_permission = auto_permission
+        self.profile        = _infer_profile(command, profile)
 
         all_rules = list(COMMON_RETRY_RULES)
-        if profile:
-            all_rules.extend(TOOL_RETRY_RULES.get(profile, []))
+        if self.profile:
+            all_rules.extend(TOOL_RETRY_RULES.get(self.profile, []))
         if extra_rules:
             all_rules.extend(extra_rules)
         all_rules = sorted(all_rules, key=lambda r: r.get("priority", 50))
@@ -649,6 +756,7 @@ class Runner:
                 success_re=self._success_re,
                 max_retries=self.max_retries,
                 auto_permission=self.auto_permission,
+                profile=self.profile,
                 retry_counts=self._retry_counts,
             )
             watcher_thread = threading.Thread(

@@ -106,6 +106,7 @@ dog run uv run my-agent --profile prod
 - wraps `claude`, `codex`, `opencode`, or any other terminal command
 - detects common recoverable failures such as SSL issues, network errors, timeouts, and rate limits
 - auto-sends `retry`, `continue`, `y`, or Enter for supported prompts
+- uses one recovery loop with tool-specific prompt-ready checks instead of assuming every CLI redraws the terminal the same way
 - stops immediately on fatal conditions to avoid useless loops
 - keeps the child process exit code unless `dog` itself aborts
 
@@ -153,6 +154,12 @@ Built-in rules cover cases like:
 
 Most network-style recoveries wait `30s` before sending `retry` or `continue`.
 Interactive confirmation prompts use shorter delays such as `0.3s` to `1.0s`.
+
+The outer recovery model is shared across tools, but the terminal state checks are not identical:
+
+- `claude` is mostly prompt-driven, so short explicit prompts are usually enough
+- `codex` and `opencode` are treated more like TUIs, so `dog` waits for the input area or highlighted action to settle before sending `retry` or `continue`
+- `dog run ...` uses the generic path unless the wrapped command is recognised as one of the built-in tool profiles
 
 Rule definitions live in [`dog/patterns.py`](/Users/striver/workspace/sectojoy/dog-cli/dog/patterns.py).
 

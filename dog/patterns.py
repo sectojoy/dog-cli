@@ -134,12 +134,40 @@ TOOL_RETRY_RULES: dict[str, list[dict]] = {
             "priority": 10,
         },
     ],
+    "opencode": [
+        {
+            "label": "Opencode highlighted continue after recoverable failure",
+            "pattern": (
+                r"(?:429 Too Many Requests|rate.?limit|quota.?exceeded"
+                r"|stream disconnected|stream closed|fetch failed|network error"
+                r"|Request timed out|ETIMEDOUT)(?:.|\n){0,240}?[›❯>]\s*continue\b"
+            ),
+            "response": "\r",
+            "delay": 0.3,
+            "priority": 6,
+        },
+        {
+            "label": "Opencode stream interruption",
+            "pattern": r"stream disconnected|stream closed",
+            "response": "continue\r",
+            "delay": 3.0,
+            "priority": 9,
+        },
+        {
+            "label": "Opencode 429 / rate limit",
+            "pattern": r"429 Too Many Requests|rate.?limit|quota.?exceeded",
+            "response": "continue\r",
+            "delay": 30.0,
+            "priority": 10,
+        },
+    ],
 }
 
 RETRY_RULES: list[dict] = (
     COMMON_RETRY_RULES
     + TOOL_RETRY_RULES["claude"]
     + TOOL_RETRY_RULES["codex"]
+    + TOOL_RETRY_RULES["opencode"]
 )
 
 # ---------------------------------------------------------------------------

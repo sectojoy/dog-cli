@@ -106,6 +106,7 @@ dog run uv run my-agent --profile prod
 - 支持 `claude`、`codex`、`opencode`，也支持任意命令行工具
 - 识别常见可恢复错误，例如 SSL、网络错误、超时、rate limit
 - 自动发送 `retry`、`continue`、`y` 或回车
+- 使用同一套恢复主流程，但会按不同 CLI 做输入框 ready 判定，而不是假设所有终端界面都同样重绘
 - 遇到 fatal 条件时立即停止，避免无意义循环
 - 除非 `dog` 自己中止，否则保留子进程原始退出码
 
@@ -153,6 +154,12 @@ dog run --retry-on "Gateway Timeout" --retry-cmd $'\n' -- my-ai-tool --interacti
 
 多数网络类恢复会先等待 `30s`，再发送 `retry` 或 `continue`。
 交互确认类提示一般只等待 `0.3s` 到 `1.0s`。
+
+三类 CLI 共享同一个恢复框架，但终端状态判断并不完全相同：
+
+- `claude` 更偏向普通 prompt 交互，很多场景只需要识别明确提示词
+- `codex` 和 `opencode` 更接近 TUI，`dog` 会等输入区或高亮动作真正稳定后，再发送 `retry` 或 `continue`
+- `dog run ...` 默认走通用路径；如果命令本身能识别成内置 profile，则会复用对应的判定逻辑
 
 规则定义在 [`dog/patterns.py`](/Users/striver/workspace/sectojoy/dog-cli/dog/patterns.py)。
 

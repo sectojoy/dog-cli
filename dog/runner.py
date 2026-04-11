@@ -134,6 +134,17 @@ def _infer_profile(command: str, profile: Optional[str]) -> Optional[str]:
     return first if first in {"claude", "codex", "opencode"} else None
 
 
+def _build_retry_rules(profile: Optional[str], extra_rules: Optional[list[dict]] = None) -> list[dict]:
+    rules: list[dict] = []
+    if profile != "claude":
+        rules.extend(COMMON_RETRY_RULES)
+    if profile:
+        rules.extend(TOOL_RETRY_RULES.get(profile, []))
+    if extra_rules:
+        rules.extend(extra_rules)
+    return sorted(rules, key=lambda r: r.get("priority", 50))
+
+
 def _status_write(message: str = "", *, newline: bool = False, clear: bool = False) -> None:
     global _LAST_STATUS_MESSAGE
     with _STATUS_LOCK:
@@ -680,12 +691,7 @@ class Runner:
         self.auto_permission = auto_permission
         self.profile        = _infer_profile(command, profile)
 
-        all_rules = list(COMMON_RETRY_RULES)
-        if self.profile:
-            all_rules.extend(TOOL_RETRY_RULES.get(self.profile, []))
-        if extra_rules:
-            all_rules.extend(extra_rules)
-        all_rules = sorted(all_rules, key=lambda r: r.get("priority", 50))
+        all_rules = _build_retry_rules(self.profile, extra_rules)
 
         self._rule_patterns = [
             (re.compile(r["pattern"], re.IGNORECASE), r)

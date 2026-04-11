@@ -176,6 +176,15 @@ RETRY_RULES: list[dict] = (
 # Each rule sends the appropriate key/text to approve the action.
 # ---------------------------------------------------------------------------
 PERMISSION_RULES: list[dict] = [
+    {
+        "label": "Permission: Claude execution plan menu → choose bypass permissions",
+        "pattern": (
+            r"Claude has written up a plan and is ready to execute\.\s*Would you like to proceed\?"
+            r"(?:.|\n){0,400}?\b1\.\s*Yes,\s*and\s*bypass permissions\b"
+        ),
+        "response": "1\r",
+        "delay": 0.3,
+    },
     # Claude Code standard approval prompts
     # The terminal shows options like:
     #   ❯ Yes   No   Always allow   Always deny

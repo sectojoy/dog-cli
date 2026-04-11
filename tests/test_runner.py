@@ -9,8 +9,15 @@ from unittest.mock import patch
 import pexpect
 
 import dog.runner as runner_mod
-from dog.runner import PatternWatcher, Runner, _build_echo_bytes_pattern, _infer_profile, _signature_id
-from dog.patterns import RETRY_RULES, SUCCESS_PATTERNS, TOOL_RETRY_RULES
+from dog.runner import (
+    PatternWatcher,
+    Runner,
+    _build_echo_bytes_pattern,
+    _build_retry_rules,
+    _infer_profile,
+    _signature_id,
+)
+from dog.patterns import COMMON_RETRY_RULES, PERMISSION_RULES, RETRY_RULES, SUCCESS_PATTERNS, TOOL_RETRY_RULES
 
 
 class FakeChild:
@@ -112,6 +119,15 @@ class PatternWatcherTests(unittest.TestCase):
 
         self.assertEqual(self.child.sent, ["y\r"])
         self.assertEqual(self.watcher._retry_counts, {})
+
+    @patch("dog.runner.console.print")
+    @patch("dog.runner.time.sleep", return_value=None)
+    def test_do_permission_selects_bypass_permissions_menu(self, _sleep, _print) -> None:
+        rule = {"label": "bypass", "response": "1\r", "delay": 0}
+
+        self.watcher._do_permission(rule, "Would you like to proceed?")
+
+        self.assertEqual(self.child.sent, ["1\r"])
 
     @patch("dog.runner.console.print")
     def test_stop_cancels_pending_retry_before_send(self, _print) -> None:
@@ -494,6 +510,25 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(_infer_profile("opencode run", None), "opencode")
         self.assertIsNone(_infer_profile("python tool.py", None))
 
+    def test_build_retry_rules_excludes_generic_network_matching_for_claude(self) -> None:
+        rules = _build_retry_rules("claude")
+        labels = {rule["label"] for rule in rules}
+
+        self.assertNotIn("API timeout / gateway timeout", labels)
+        self.assertIn("Claude explicit (y to retry) prompt", labels)
+
+    def test_claude_profile_does_not_match_generic_e2e_timeout_logs(self) -> None:
+        runner = Runner("claude", profile="claude")
+
+        matched = None
+        text = "Playwright TimeoutError: page.goto: Timeout 30000ms exceeded"
+        for pattern, rule in runner._rule_patterns:
+            if pattern.search(text):
+                matched = rule
+                break
+
+        self.assertIsNone(matched)
+
     @patch("dog.runner.console.print")
     @patch("dog.runner.signal.signal")
     @patch("dog.runner.signal.getsignal", return_value=signal.SIG_DFL)
@@ -725,6 +760,24 @@ class RunnerTests(unittest.TestCase):
 
 
 class PatternRulesTests(unittest.TestCase):
+    def test_permission_rules_choose_bypass_permissions_for_execution_menu(self) -> None:
+        text = (
+            "Claude has written up a plan and is ready to execute. Would you like to proceed?\n\n"
+            "❯ 1. Yes, and bypass permissions\n"
+            "  2. Yes, manually approve edits\n"
+            "  3. Tell Claude what to change\n"
+        )
+
+        matched = None
+        for rule in PERMISSION_RULES:
+            if re.search(rule["pattern"], text, re.IGNORECASE):
+                matched = rule
+                break
+
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["label"], "Permission: Claude execution plan menu → choose bypass permissions")
+        self.assertEqual(matched["response"], "1\r")
+
     def test_opencode_highlighted_continue_rule_prefers_enter(self) -> None:
         rules = TOOL_RETRY_RULES["opencode"]
         text = "429 Too Many Requests\n> continue"
@@ -800,3 +853,24 @@ class PatternRulesTests(unittest.TestCase):
         text = "• 已按 docs 的 Stage 1 文档完成第一版落地。现在工程从模板改成了 iOS 15 基线的 Stage 1 结构。"
 
         self.assertIsNotNone(success_re.search(text))
+
+    def test_claude_retries_rely_on_explicit_prompts_not_generic_network_logs(self) -> None:
+        rules = _build_retry_rules("claude")
+        timeout_text = "Playwright TimeoutError: locator.click: Timeout 30000ms exceeded"
+        retry_prompt_text = "API Error: Network error\n(y to retry)"
+
+        timeout_match = None
+        for rule in rules:
+            if re.search(rule["pattern"], timeout_text, re.IGNORECASE):
+                timeout_match = rule
+                break
+
+        retry_prompt_match = None
+        for rule in rules:
+            if re.search(rule["pattern"], retry_prompt_text, re.IGNORECASE):
+                retry_prompt_match = rule
+                break
+
+        self.assertIsNone(timeout_match)
+        self.assertIsNotNone(retry_prompt_match)
+        self.assertEqual(retry_prompt_match["label"], "Claude explicit (y to retry) prompt")

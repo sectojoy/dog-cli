@@ -24,6 +24,7 @@ Signal handling
 """
 from __future__ import annotations
 
+import codecs
 import os
 import errno
 import re
@@ -47,6 +48,7 @@ from dog.patterns import (
 
 console = Console(stderr=True)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_HIGHLIGHTED_ACTION_PREFIX_RE = r"(?:\x1b\[[0-9;?]*[ -/]*[@-~])*[ \t]*[›❯>][ \t]*"
 _STATUS_LOCK = threading.Lock()
 _LAST_STATUS_MESSAGE = ""
 
@@ -79,15 +81,62 @@ def _build_echo_pattern(command: str) -> Optional[re.Pattern]:
         return None
     escaped = re.escape(normalized)
     return re.compile(
-        rf"(^|[\r\n])[ \t]*(?:[›>][ \t]*)?{escaped}(?=($|[\r\n]))",
+        rf"(^|[\r\n])(?:\x1b\[[0-9;?]*[ -/]*[@-~])*[ \t]*"
+        rf"(?:(?:[›❯>])[ \t]*)?(?:\x1b\[[0-9;?]*[ -/]*[@-~])*"
+        rf"{escaped}(?:\x1b\[[0-9;?]*[ -/]*[@-~])*[ \t]*(?=($|[\r\n]|\x1b))",
         re.IGNORECASE,
     )
+
+
+def _build_echo_bytes_pattern(command: str) -> Optional[re.Pattern[bytes]]:
+    normalized = command.strip()
+    if not normalized:
+        return None
+    escaped = re.escape(normalized.encode("utf-8"))
+    return re.compile(
+        rb"(^|[\r\n])(?:\x1b\[[0-9;?]*[ -/]*[@-~])*[ \t]*"
+        rb"(?:(?:\xe2\x80\xba|\xe2\x9d\xaf|>)[ \t]*)?(?:\x1b\[[0-9;?]*[ -/]*[@-~])*"
+        + escaped
+        + rb"(?:\x1b\[[0-9;?]*[ -/]*[@-~])*[ \t]*(?=($|[\r\n]|\x1b))",
+        re.IGNORECASE,
+    )
+
+
+def _select_highlighted_response(response: str, screen_text: str) -> str:
+    stripped = response.strip().lower()
+    if stripped not in {"retry", "continue"}:
+        return response
+
+    normalized_screen = _ANSI_RE.sub("", screen_text)
+    pattern = re.compile(
+        rf"(?:^|[\r\n]){_HIGHLIGHTED_ACTION_PREFIX_RE}{re.escape(stripped)}\b",
+        re.IGNORECASE,
+    )
+    if pattern.search(normalized_screen):
+        return "\r"
+    return response
 
 
 def _status_write(message: str = "", *, newline: bool = False, clear: bool = False) -> None:
     global _LAST_STATUS_MESSAGE
     with _STATUS_LOCK:
         if _interactive_tty():
+            if clear:
+                sys.stderr.write("\r\033[2K")
+                if newline:
+                    sys.stderr.write("\n")
+                _LAST_STATUS_MESSAGE = ""
+                sys.stderr.flush()
+                return
+            if message and message == _LAST_STATUS_MESSAGE and not newline:
+                return
+            sys.stderr.write("\r\033[2K")
+            if message:
+                sys.stderr.write(message)
+            if newline:
+                sys.stderr.write("\n")
+            _LAST_STATUS_MESSAGE = message if message else ""
+            sys.stderr.flush()
             return
         if clear and not message and not newline:
             return
@@ -102,7 +151,7 @@ def _status_write(message: str = "", *, newline: bool = False, clear: bool = Fal
 
 
 def _status_clear() -> None:
-    return None
+    _status_write(clear=True)
 
 
 def _status_show(message: str) -> None:
@@ -111,6 +160,22 @@ def _status_show(message: str) -> None:
 
 def _status_log(message: str) -> None:
     _status_write(message, newline=True, clear=True)
+
+
+def _format_wait_status(
+    *,
+    action: str,
+    retry_count: int,
+    max_retries: int,
+    label: str,
+    response: str,
+    remaining: float,
+) -> str:
+    response_preview = repr(response.strip()) or "<Enter>"
+    return (
+        f"dog {action} {retry_count}/{max_retries}: {label}; "
+        f"sending {response_preview} in {remaining:.1f}s"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -156,20 +221,22 @@ class PatternWatcher:
         self._idle_event = threading.Event()
         self._idle_event.set()
         self._restart_request: Optional[dict[str, str | int]] = None
+        self._output_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._input_decoder = codecs.getincrementaldecoder("utf-8")("replace")
         # Prevent rapid re-firing on the same chunk
         self._last_action_time = 0.0
 
     # ── Called from output_filter (main thread) ───────────────────────────────
 
     def feed(self, data: bytes) -> bytes:
-        text = data.decode("utf-8", errors="replace")
-        visible_text = self._suppress_auto_echo(text)
+        visible_bytes = self._suppress_auto_echo_bytes(data)
+        text = self._output_decoder.decode(visible_bytes, final=False)
         with self._lock:
-            self._buf += visible_text
+            self._buf += text
             if len(self._buf) > 8192:
                 self._buf = self._buf[-8192:]
         self._notify.set()
-        return visible_text.encode("utf-8", errors="replace")
+        return visible_bytes
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -202,22 +269,22 @@ class PatternWatcher:
             else:
                 time.sleep(0.01)
 
-    def _suppress_auto_echo(self, text: str) -> str:
+    def _suppress_auto_echo_bytes(self, data: bytes) -> bytes:
         now = time.monotonic()
         with self._lock:
             rules = [(pattern, expires_at) for pattern, expires_at in self._pending_echo_suppression if expires_at > now]
             self._pending_echo_suppression = rules
 
         if not rules:
-            return text
+            return data
 
-        filtered = text
+        filtered = data
         for pattern, _expires_at in rules:
             filtered = pattern.sub(lambda m: m.group(1), filtered)
         return filtered
 
     def note_user_input(self, data: bytes) -> bytes:
-        text = data.decode("utf-8", errors="replace")
+        text = self._input_decoder.decode(data, final=False)
         with self._lock:
             for ch in text:
                 if ch in ("\r", "\n"):
@@ -300,6 +367,7 @@ class PatternWatcher:
         self,
         delay: float,
         *,
+        action: str,
         response: str,
         label: str,
         retry_count: int,
@@ -308,16 +376,33 @@ class PatternWatcher:
         if delay <= 0:
             return True
 
-        response_preview = repr(response.strip()) or "<Enter>"
         deadline = time.monotonic() + delay
+        last_shown_second: Optional[int] = None
 
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                _status_clear()
                 return True
-            if self._stop_event.wait(min(0.2, remaining)):
-                return False
             if self._user_is_typing():
+                _status_clear()
+                return False
+            if _interactive_tty():
+                whole_seconds = int(remaining)
+                if whole_seconds != last_shown_second:
+                    _status_show(
+                        _format_wait_status(
+                            action=action,
+                            retry_count=retry_count,
+                            max_retries=self._max_retries,
+                            label=label,
+                            response=response,
+                            remaining=remaining,
+                        )
+                    )
+                    last_shown_second = whole_seconds
+            if self._stop_event.wait(min(0.2, remaining)):
+                _status_clear()
                 return False
 
     def _child_is_alive(self) -> bool:
@@ -362,7 +447,13 @@ class PatternWatcher:
                 f"dog auto-approve: {label}; "
                 f"sending {repr(response.strip()) or '<Enter>'} in {delay:.1f}s"
             )
-            if not self._wait_with_progress(delay, response=response, label=label, retry_count=1):
+            if not self._wait_with_progress(
+                delay,
+                action="auto-approve",
+                response=response,
+                label=label,
+                retry_count=1,
+            ):
                 return
             self._safe_send(response)
             with self._lock:
@@ -400,6 +491,9 @@ class PatternWatcher:
             self._retry_counts[signature_id] = retry_count
             delay    = rule.get("delay", 1.0)
             response = rule.get("response", "retry\n")
+            with self._lock:
+                screen_text = self._buf
+            response = _select_highlighted_response(response, screen_text)
 
             _status_log(
                 f"dog retry {retry_count}/{self._max_retries}: {label}; "
@@ -407,6 +501,7 @@ class PatternWatcher:
             )
             if not self._wait_with_progress(
                 delay,
+                action="retry",
                 response=response,
                 label=label,
                 retry_count=retry_count,
@@ -435,7 +530,7 @@ class PatternWatcher:
         if self._stop_event.is_set() or not self._child_is_alive():
             return
         try:
-            pattern = _build_echo_pattern(text)
+            pattern = _build_echo_bytes_pattern(text)
             if pattern:
                 with self._lock:
                     self._pending_echo_suppression.append((pattern, time.monotonic() + 2.5))

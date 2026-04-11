@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pexpect
 
 import dog.runner as runner_mod
-from dog.runner import PatternWatcher, Runner, _build_echo_pattern, _signature_id
+from dog.runner import PatternWatcher, Runner, _build_echo_bytes_pattern, _signature_id
 from dog.patterns import RETRY_RULES, SUCCESS_PATTERNS, TOOL_RETRY_RULES
 
 
@@ -205,6 +205,42 @@ class PatternWatcherTests(unittest.TestCase):
 
         self.assertEqual(sorted(self.watcher._retry_counts.values()), [1, 2])
 
+    @patch("dog.runner.console.print")
+    @patch("dog.runner.time.sleep", return_value=None)
+    def test_do_retry_selects_highlighted_retry_menu_with_enter(self, _sleep, _print) -> None:
+        rule = {"label": "rate limit", "response": "retry\r", "delay": 0}
+        self.watcher._buf = (
+            "exceeded retry limit, last status: 429 Too Many Requests\n"
+            "› retry"
+        )
+
+        self.watcher._do_retry(rule, "429 too many requests")
+
+        self.assertEqual(self.child.sent, ["\r"])
+
+    @patch("dog.runner.console.print")
+    @patch("dog.runner.time.sleep", return_value=None)
+    def test_do_retry_selects_highlighted_continue_menu_with_enter(self, _sleep, _print) -> None:
+        rule = {"label": "stream disconnected", "response": "continue\r", "delay": 0}
+        self.watcher._buf = "stream disconnected before completion\n❯ continue"
+
+        self.watcher._do_retry(rule, "stream disconnected before completion")
+
+        self.assertEqual(self.child.sent, ["\r"])
+
+    @patch("dog.runner.console.print")
+    @patch("dog.runner.time.sleep", return_value=None)
+    def test_do_retry_selects_highlighted_continue_menu_with_ansi_word_styling(self, _sleep, _print) -> None:
+        rule = {"label": "Codex 429 Too Many Requests", "response": "continue\r", "delay": 0}
+        self.watcher._buf = (
+            "exceeded retry limit, last status: 429 Too Many Requests\n"
+            "❯ \x1b[7mcontinue\x1b[0m"
+        )
+
+        self.watcher._do_retry(rule, "429 too many requests")
+
+        self.assertEqual(self.child.sent, ["\r"])
+
     def test_match_allows_same_signature_again_after_cooldown(self) -> None:
         rule = {"response": "continue\r", "label": "codex", "delay": 1.0}
         self.watcher._rule_patterns = [
@@ -222,7 +258,7 @@ class PatternWatcherTests(unittest.TestCase):
         self.assertIsNotNone(allowed)
 
     def test_feed_suppresses_recent_auto_echo_line(self) -> None:
-        pattern = _build_echo_pattern("continue\r")
+        pattern = _build_echo_bytes_pattern("continue\r")
         self.assertIsNotNone(pattern)
         self.watcher._pending_echo_suppression = [(pattern, 999.0)]
 
@@ -233,7 +269,7 @@ class PatternWatcherTests(unittest.TestCase):
         self.assertEqual(self.watcher._buf, "\n\n\n")
 
     def test_feed_suppresses_plain_auto_echo_line_without_prompt_marker(self) -> None:
-        pattern = _build_echo_pattern("continue\r")
+        pattern = _build_echo_bytes_pattern("continue\r")
         self.assertIsNotNone(pattern)
         self.watcher._pending_echo_suppression = [(pattern, 999.0)]
 
@@ -243,12 +279,43 @@ class PatternWatcherTests(unittest.TestCase):
         self.assertEqual(visible, b"\n\n")
         self.assertEqual(self.watcher._buf, "\n\n")
 
+    def test_feed_suppresses_recent_auto_echo_line_with_unicode_prompt_marker(self) -> None:
+        pattern = _build_echo_bytes_pattern("continue\r")
+        self.assertIsNotNone(pattern)
+        self.watcher._pending_echo_suppression = [(pattern, 999.0)]
+
+        with patch("dog.runner.time.monotonic", return_value=100.0):
+            visible = self.watcher.feed(b"\n\xe2\x9d\xaf continue")
+
+        self.assertEqual(visible, b"\n")
+        self.assertEqual(self.watcher._buf, "\n")
+
+    def test_feed_suppresses_recent_auto_echo_line_without_trailing_newline(self) -> None:
+        pattern = _build_echo_bytes_pattern("continue\r")
+        self.assertIsNotNone(pattern)
+        self.watcher._pending_echo_suppression = [(pattern, 999.0)]
+
+        with patch("dog.runner.time.monotonic", return_value=100.0):
+            visible = self.watcher.feed(b"\ncontinue")
+
+        self.assertEqual(visible, b"\n")
+        self.assertEqual(self.watcher._buf, "\n")
+
     def test_feed_keeps_normal_output_when_no_echo_suppression_matches(self) -> None:
         with patch("dog.runner.time.monotonic", return_value=100.0):
             visible = self.watcher.feed(b"regular output\n")
 
         self.assertEqual(visible, b"regular output\n")
         self.assertEqual(self.watcher._buf, "regular output\n")
+
+    def test_feed_preserves_split_utf8_bytes_without_replacement_garbling(self) -> None:
+        border = "─".encode("utf-8")
+
+        first = self.watcher.feed(border[:1])
+        second = self.watcher.feed(border[1:])
+
+        self.assertEqual(first + second, border)
+        self.assertEqual(self.watcher._buf, "─")
 
     def test_wait_with_progress_cancels_silently_when_user_types_on_tty(self) -> None:
         stderr = io.StringIO()
@@ -261,6 +328,7 @@ class PatternWatcherTests(unittest.TestCase):
         ):
             cancelled = self.watcher._wait_with_progress(
                 1.0,
+                action="retry",
                 response="continue\r",
                 label="Codex 429 Too Many Requests",
                 retry_count=1,
@@ -268,6 +336,28 @@ class PatternWatcherTests(unittest.TestCase):
 
         self.assertFalse(cancelled)
         self.assertEqual(stderr.getvalue(), "")
+
+    def test_wait_with_progress_shows_countdown_on_interactive_tty(self) -> None:
+        stderr = FakeTTYStream()
+
+        with (
+            patch("dog.runner.sys.stdout", FakeTTYStream()),
+            patch("dog.runner.sys.stderr", stderr),
+            patch.object(self.watcher._stop_event, "wait", side_effect=[False, False, False, False, False]),
+            patch("dog.runner.time.monotonic", side_effect=[100.0, 100.0, 100.6, 101.2, 101.8, 102.1]),
+        ):
+            finished = self.watcher._wait_with_progress(
+                2.0,
+                action="retry",
+                response="continue\r",
+                label="Codex 429 Too Many Requests",
+                retry_count=1,
+            )
+
+        self.assertTrue(finished)
+        self.assertIn("dog retry 1/2: Codex 429 Too Many Requests; sending 'continue' in 2.0s", stderr.getvalue())
+        self.assertIn("dog retry 1/2: Codex 429 Too Many Requests; sending 'continue' in 1.4s", stderr.getvalue())
+        self.assertTrue(stderr.getvalue().endswith("\r\033[2K"))
 
     def test_wait_for_idle_waits_for_pending_notify_to_drain(self) -> None:
         self.watcher._notify.set()
@@ -299,7 +389,7 @@ class PatternWatcherTests(unittest.TestCase):
         self.assertIn("dog retry 1/2: Codex 429 Too Many Requests; sending 'continue' in 30.0s", stderr.getvalue())
         self.assertNotIn("\r\033[2K", stderr.getvalue())
 
-    def test_do_retry_stays_silent_on_interactive_tty(self) -> None:
+    def test_do_retry_shows_transient_status_on_interactive_tty(self) -> None:
         stdout = FakeTTYStream()
         stderr = FakeTTYStream()
         rule = {"label": "Codex 429 Too Many Requests", "response": "continue\r", "delay": 30.0}
@@ -311,7 +401,7 @@ class PatternWatcherTests(unittest.TestCase):
         ):
             self.watcher._do_retry(rule, "429 too many requests")
 
-        self.assertEqual(stderr.getvalue(), "")
+        self.assertIn("\r\033[2Kdog retry 1/2: Codex 429 Too Many Requests; sending 'continue' in 30.0s", stderr.getvalue())
         self.assertEqual(stdout.getvalue(), "")
 
 

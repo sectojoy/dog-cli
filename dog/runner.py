@@ -43,6 +43,7 @@ from dog.patterns import (
     TOOL_RETRY_RULES,
     PERMISSION_RULES,
     FATAL_PATTERNS,
+    INTERRUPTION_PATTERNS,
     SUCCESS_PATTERNS,
 )
 
@@ -121,7 +122,7 @@ def _screen_has_input_prompt(screen_text: str) -> bool:
     normalized_screen = _ANSI_RE.sub("", screen_text)
     return bool(
         re.search(
-            r"(?:^|[\r\n])[ \t]*[›❯>][ \t]*[^\r\n]*$",
+            r"(?:^|[\r\n])[ \t]*[›❯>][ \t]*$",
             normalized_screen,
         )
     )
@@ -224,6 +225,7 @@ class PatternWatcher:
         rule_patterns: list,
         permission_patterns: list,
         fatal_re: re.Pattern,
+        interrupt_re: re.Pattern,
         success_re: re.Pattern,
         max_retries: int,
         auto_permission: bool,
@@ -234,6 +236,7 @@ class PatternWatcher:
         self._rule_patterns    = rule_patterns
         self._perm_patterns    = permission_patterns
         self._fatal_re         = fatal_re
+        self._interrupt_re     = interrupt_re
         self._success_re       = success_re
         self._max_retries      = max_retries
         self._auto_permission  = auto_permission
@@ -245,6 +248,7 @@ class PatternWatcher:
         self._stop_event = threading.Event()
         self._retry_counts = retry_counts if retry_counts is not None else {}
         self._success_seen = False
+        self._interrupted_seen = False
         self._input_buf = ""
         self._last_triggered_at: dict[str, float] = {}
         self._pending_echo_suppression: list[tuple[re.Pattern, float]] = []
@@ -324,9 +328,12 @@ class PatternWatcher:
                 if ch in ("\r", "\n"):
                     if self._input_buf.strip():
                         self._success_seen = False
+                        self._interrupted_seen = False
                         self._buf = ""
                         self._last_triggered_at = {}
                         self._retry_counts = {}
+                    self._input_buf = ""
+                elif ch == "\x1b":
                     self._input_buf = ""
                 elif ch in ("\x7f", "\b"):
                     self._input_buf = self._input_buf[:-1]
@@ -368,6 +375,7 @@ class PatternWatcher:
             # 2. Success
             if self._success_re.search(buf) and not self._success_seen:
                 self._success_seen = True
+                self._interrupted_seen = False
                 self._retry_counts = {}
                 console.print(
                     "\n[bold green]🎉 dog: task completed — "
@@ -382,7 +390,21 @@ class PatternWatcher:
             if self._success_seen:
                 continue
 
-            # 3. Permission auto-approve
+            # 3. User interruption / cancel
+            if self._interrupt_re.search(buf):
+                self._interrupted_seen = True
+                self._success_seen = False
+                self._retry_counts = {}
+                with self._lock:
+                    self._buf = ""
+                    self._last_triggered_at = {}
+                self._last_action_time = time.monotonic()
+                continue
+
+            if self._interrupted_seen:
+                continue
+
+            # 4. Permission auto-approve
             if self._auto_permission:
                 matched = self._match(buf, self._perm_patterns)
                 rule = matched[0] if matched else None
@@ -390,7 +412,7 @@ class PatternWatcher:
                     self._do_permission(rule, matched[1])
                     continue
 
-            # 4. Retry
+            # 5. Retry
             matched = self._match(buf, self._rule_patterns)
             rule = matched[0] if matched else None
             if rule:
@@ -445,16 +467,31 @@ class PatternWatcher:
             return False
         return self._profile in {"codex", "opencode"}
 
-    def _ready_response_for_profile(self, response: str, screen_text: str) -> tuple[bool, str]:
+    def _ready_response_for_profile(self, rule: dict, response: str, screen_text: str) -> tuple[bool, str]:
         selected = _select_highlighted_response(response, screen_text)
         if selected == "\r":
             return True, selected
-        if self._profile in {"codex", "opencode"} and _screen_has_input_prompt(screen_text):
+        if (
+            self._profile in {"codex", "opencode"}
+            and rule.get("allow_plain_prompt")
+            and _screen_has_input_prompt(screen_text)
+        ):
             return True, selected
         return False, selected
 
+    def _rule_is_actionable(self, rule: dict, screen_text: str) -> bool:
+        response = rule.get("response", "retry\n")
+        if not self._response_needs_settled_prompt(response):
+            return True
+        if not self._child_is_alive():
+            return True
+
+        ready, _selected = self._ready_response_for_profile(rule, response, screen_text)
+        return ready
+
     def _wait_for_input_prompt(
         self,
+        rule: dict,
         response: str,
         *,
         action: str,
@@ -476,7 +513,7 @@ class PatternWatcher:
                 last_output_at = self._last_output_at
 
             now = time.monotonic()
-            prompt_ready, selected = self._ready_response_for_profile(response, screen_text)
+            prompt_ready, selected = self._ready_response_for_profile(rule, response, screen_text)
             screen_signature = _normalize_signature(screen_text)
             if prompt_ready:
                 if screen_signature != ready_signature:
@@ -494,7 +531,7 @@ class PatternWatcher:
 
             if now >= deadline:
                 _status_clear()
-                return selected
+                return selected if prompt_ready or not self._child_is_alive() else None
             if self._user_is_typing():
                 _status_clear()
                 return None
@@ -533,7 +570,9 @@ class PatternWatcher:
             cooldown = max(float(rule.get("delay", 1.0)), 2.0)
             last_triggered_at = self._last_triggered_at.get(signature_id, 0.0)
             if time.monotonic() - last_triggered_at < cooldown:
-                return None
+                continue
+            if not self._rule_is_actionable(rule, text):
+                continue
             return rule, matched_text
         return None
 
@@ -613,6 +652,7 @@ class PatternWatcher:
                 return
             if float(delay) > 0 and self._response_needs_settled_prompt(response):
                 response = self._wait_for_input_prompt(
+                    rule,
                     response,
                     action="retry",
                     label=label,
@@ -702,6 +742,7 @@ class Runner:
             for r in PERMISSION_RULES
         ]
         self._fatal_re  = _compile(FATAL_PATTERNS)
+        self._interrupt_re = _compile(INTERRUPTION_PATTERNS)
         self._success_re = _compile(SUCCESS_PATTERNS)
         self._child: Optional[pexpect.spawn] = None
         self._watcher: Optional[PatternWatcher] = None
@@ -759,6 +800,7 @@ class Runner:
                 rule_patterns=self._rule_patterns,
                 permission_patterns=self._perm_patterns,
                 fatal_re=self._fatal_re,
+                interrupt_re=self._interrupt_re,
                 success_re=self._success_re,
                 max_retries=self.max_retries,
                 auto_permission=self.auto_permission,

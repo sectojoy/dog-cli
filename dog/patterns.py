@@ -109,6 +109,7 @@ TOOL_RETRY_RULES: dict[str, list[dict]] = {
                 r"|Transport error:\s*network error:\s*error decoding response body"
             ),
             "response": "continue\r",
+            "allow_plain_prompt": True,
             "delay": 3.0,
             "priority": 8,
         },
@@ -116,6 +117,7 @@ TOOL_RETRY_RULES: dict[str, list[dict]] = {
             "label": "Codex 429 Too Many Requests",
             "pattern": r"exceeded retry limit, last status:\s*429 Too Many Requests|429 Too Many Requests",
             "response": "continue\r",
+            "allow_plain_prompt": True,
             "delay": 30.0,
             "priority": 9,
         },
@@ -123,6 +125,7 @@ TOOL_RETRY_RULES: dict[str, list[dict]] = {
             "label": "Codex APIConnectionError",
             "pattern": r"openai\.APIConnectionError|openai\.APITimeoutError",
             "response": "continue\r",
+            "allow_plain_prompt": True,
             "delay": 30.0,
             "priority": 10,
         },
@@ -130,6 +133,7 @@ TOOL_RETRY_RULES: dict[str, list[dict]] = {
             "label": "Codex RateLimitError",
             "pattern": r"openai\.RateLimitError",
             "response": "continue\r",
+            "allow_plain_prompt": True,
             "delay": 30.0,
             "priority": 10,
         },
@@ -150,6 +154,7 @@ TOOL_RETRY_RULES: dict[str, list[dict]] = {
             "label": "Opencode stream interruption",
             "pattern": r"stream disconnected|stream closed",
             "response": "continue\r",
+            "allow_plain_prompt": True,
             "delay": 3.0,
             "priority": 9,
         },
@@ -157,6 +162,7 @@ TOOL_RETRY_RULES: dict[str, list[dict]] = {
             "label": "Opencode 429 / rate limit",
             "pattern": r"429 Too Many Requests|rate.?limit|quota.?exceeded",
             "response": "continue\r",
+            "allow_plain_prompt": True,
             "delay": 30.0,
             "priority": 10,
         },
@@ -254,6 +260,15 @@ SUCCESS_PATTERNS: list[str] = [
     r"(?:^|\n)[•*-]\s*已按.*完成",
     r"(?:^|\n)[•*-]\s*已.*完成第?[一二三四五六七八九0-9]+版",
     r"(?:^|\n)[•*-]\s*验证也已?完成",
+]
+
+# ---------------------------------------------------------------------------
+# INTERRUPTION PATTERNS — user cancelled / interrupted the current turn
+# dog should hand control back to the user instead of auto-retrying.
+# ---------------------------------------------------------------------------
+INTERRUPTION_PATTERNS: list[str] = [
+    r"Conversation interrupted\s*-\s*tell the model what to do differently",
+    r"\bInterrupted\b.*tell the model what to do differently",
 ]
 
 # ---------------------------------------------------------------------------

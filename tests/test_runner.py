@@ -25,6 +25,7 @@ class FakeChild:
         self,
         exitstatus: int | None = 0,
         interact_output: bytes = b"hello from child",
+        interact_chunks: list[bytes] | None = None,
         tail_output: bytes = b"",
         interact_delay: float = 0.0,
         preserve_exitstatus_after_interact: bool = False,
@@ -36,6 +37,7 @@ class FakeChild:
         self.filtered_output: bytes | None = None
         self.window_size: tuple[int, int] | None = None
         self.interact_output = interact_output
+        self.interact_chunks = interact_chunks
         self.tail_output = tail_output
         self.interact_delay = interact_delay
         self.preserve_exitstatus_after_interact = preserve_exitstatus_after_interact
@@ -50,9 +52,13 @@ class FakeChild:
         if input_filter is not None:
             input_filter(b"")
         if output_filter is not None:
-            self.filtered_output = output_filter(self.interact_output)
-        if self.interact_delay:
-            time.sleep(self.interact_delay)
+            chunks = self.interact_chunks or [self.interact_output]
+            visible_parts: list[bytes] = []
+            for chunk in chunks:
+                visible_parts.append(output_filter(chunk))
+                if self.interact_delay:
+                    time.sleep(self.interact_delay)
+            self.filtered_output = b"".join(visible_parts)
         if self.exitstatus is None and not self.preserve_exitstatus_after_interact:
             self.exitstatus = 0
 
@@ -82,6 +88,16 @@ class FakeTTYStream(io.StringIO):
         return True
 
 
+CODEX_INTERRUPTED_TRANSCRIPT = [
+    "› photos相册感觉打开的不是相册需要修复下问题。\n".encode("utf-8"),
+    (
+        "\n■ Conversation interrupted - tell the model what to do differently. "
+        "Something went wrong? Hit `/feedback` to report the issue.\n"
+    ).encode("utf-8"),
+    b"> ",
+]
+
+
 class PatternWatcherTests(unittest.TestCase):
     def setUp(self) -> None:
         runner_mod._LAST_STATUS_MESSAGE = ""
@@ -91,6 +107,7 @@ class PatternWatcherTests(unittest.TestCase):
             rule_patterns=[],
             permission_patterns=[],
             fatal_re=re.compile(r"fatal"),
+            interrupt_re=re.compile(r"interrupted"),
             success_re=re.compile(r"done"),
             max_retries=2,
             auto_permission=True,
@@ -177,6 +194,12 @@ class PatternWatcherTests(unittest.TestCase):
         self.assertEqual(self.watcher._buf, "")
         self.assertEqual(self.watcher._retry_counts, {})
 
+    def test_note_user_input_escape_clears_draft_buffer(self) -> None:
+        self.watcher.note_user_input(b"draft text")
+        self.watcher.note_user_input(b"\x1b")
+
+        self.assertEqual(self.watcher._input_buf, "")
+
     @patch("dog.runner.console.print")
     @patch("dog.runner.time.sleep", return_value=None)
     def test_success_state_blocks_followup_retry_until_user_submits_again(self, _sleep, _print) -> None:
@@ -209,6 +232,88 @@ class PatternWatcherTests(unittest.TestCase):
         self.watcher.note_user_input(b"new task\r")
         third = self.watcher._match("network error", self.watcher._rule_patterns)
         self.assertIsNotNone(third)
+
+    def test_codex_generic_retry_rule_requires_explicit_recovery_state(self) -> None:
+        self.watcher._profile = "codex"
+        self.watcher._rule_patterns = [
+            (
+                re.compile(r"Unexpected error", re.IGNORECASE),
+                {"response": "retry\r", "label": "generic retry", "delay": 30.0},
+            )
+        ]
+
+        matched = self.watcher._match(
+            "Conversation interrupted - tell the model what to do differently.\nUnexpected error / crash\n> ",
+            self.watcher._rule_patterns,
+        )
+
+        self.assertIsNone(matched)
+
+    def test_codex_continue_rule_allows_blank_prompt_resume(self) -> None:
+        self.watcher._profile = "codex"
+        self.watcher._rule_patterns = [
+            (
+                re.compile(r"429 Too Many Requests", re.IGNORECASE),
+                {
+                    "response": "continue\r",
+                    "label": "Codex 429 Too Many Requests",
+                    "delay": 30.0,
+                    "allow_plain_prompt": True,
+                },
+            )
+        ]
+
+        matched = self.watcher._match(
+            "exceeded retry limit, last status: 429 Too Many Requests\n> ",
+            self.watcher._rule_patterns,
+        )
+
+        self.assertIsNotNone(matched)
+
+    def test_codex_continue_rule_does_not_send_into_nonblank_prompt(self) -> None:
+        self.watcher._profile = "codex"
+        self.watcher._rule_patterns = [
+            (
+                re.compile(r"429 Too Many Requests", re.IGNORECASE),
+                {
+                    "response": "continue\r",
+                    "label": "Codex 429 Too Many Requests",
+                    "delay": 30.0,
+                    "allow_plain_prompt": True,
+                },
+            )
+        ]
+
+        matched = self.watcher._match(
+            "exceeded retry limit, last status: 429 Too Many Requests\n> draft still in prompt",
+            self.watcher._rule_patterns,
+        )
+
+        self.assertIsNone(matched)
+
+    @patch("dog.runner.console.print")
+    def test_interruption_screen_blocks_followup_retry(self, _print) -> None:
+        self.watcher._profile = "codex"
+        self.watcher._rule_patterns = [
+            (
+                re.compile(r"Unexpected error", re.IGNORECASE),
+                {"response": "retry\r", "label": "generic retry", "delay": 0},
+            )
+        ]
+        thread = threading.Thread(target=self.watcher.run, daemon=True)
+        thread.start()
+
+        try:
+            self.watcher.feed(
+                b"Conversation interrupted - tell the model what to do differently.\nUnexpected error / crash\n> "
+            )
+            time.sleep(0.1)
+        finally:
+            self.watcher.stop()
+            thread.join(timeout=1.0)
+
+        self.assertTrue(self.watcher._interrupted_seen)
+        self.assertEqual(self.child.sent, [])
 
     @patch("dog.runner.console.print")
     @patch("dog.runner.time.sleep", return_value=None)
@@ -294,12 +399,14 @@ class PatternWatcherTests(unittest.TestCase):
         self.watcher._profile = "codex"
         self.watcher._buf = "exceeded retry limit, last status: 429 Too Many Requests\n> "
         self.watcher._last_output_at = 100.0
+        rule = {"response": "continue\r", "allow_plain_prompt": True}
 
         with (
             patch("dog.runner.time.monotonic", side_effect=[100.0, 100.1, 100.1, 100.5]),
             patch.object(self.watcher._stop_event, "wait", side_effect=[False, False]),
         ):
             response = self.watcher._wait_for_input_prompt(
+                rule,
                 "continue\r",
                 action="retry",
                 label="Codex 429 Too Many Requests",
@@ -316,6 +423,7 @@ class PatternWatcherTests(unittest.TestCase):
             rule_patterns=[],
             permission_patterns=[],
             fatal_re=re.compile(r"fatal"),
+            interrupt_re=re.compile(r"interrupted"),
             success_re=re.compile(r"done"),
             max_retries=2,
             auto_permission=True,
@@ -329,6 +437,7 @@ class PatternWatcherTests(unittest.TestCase):
             patch.object(watcher._stop_event, "wait", side_effect=[False]),
         ):
             response = watcher._wait_for_input_prompt(
+                {"response": "continue\r", "allow_plain_prompt": True},
                 "continue\r",
                 action="retry",
                 label="opencode retry",
@@ -576,6 +685,31 @@ class RunnerTests(unittest.TestCase):
     @patch("dog.runner.signal.signal")
     @patch("dog.runner.signal.getsignal", return_value=signal.SIG_DFL)
     @patch("dog.runner.pexpect.spawn")
+    def test_run_codex_interrupted_transcript_does_not_auto_retry(
+        self,
+        spawn_mock,
+        _getsignal,
+        _signal,
+        _print,
+    ) -> None:
+        child = FakeChild(
+            exitstatus=None,
+            interact_chunks=CODEX_INTERRUPTED_TRANSCRIPT,
+            interact_delay=0.02,
+        )
+        spawn_mock.return_value = child
+
+        exit_code = Runner("codex", max_retries=2, profile="codex").run()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(child.sent, [])
+        self.assertTrue(child.wait_called)
+        self.assertEqual(spawn_mock.call_count, 1)
+
+    @patch("dog.runner.console.print")
+    @patch("dog.runner.signal.signal")
+    @patch("dog.runner.signal.getsignal", return_value=signal.SIG_DFL)
+    @patch("dog.runner.pexpect.spawn")
     def test_run_waits_for_pending_retry_before_stopping_watcher(
         self,
         spawn_mock,
@@ -741,6 +875,7 @@ class RunnerTests(unittest.TestCase):
             rule_patterns=[],
             permission_patterns=[],
             fatal_re=re.compile(r"fatal"),
+            interrupt_re=re.compile(r"interrupted"),
             success_re=re.compile(r"done"),
             max_retries=2,
             auto_permission=True,

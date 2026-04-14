@@ -121,12 +121,14 @@ def _select_highlighted_response(response: str, screen_text: str) -> str:
 
 def _screen_has_input_prompt(screen_text: str) -> bool:
     normalized_screen = _ANSI_RE.sub("", screen_text)
-    return bool(
-        re.search(
-            r"(?:^|[\r\n])[ \t]*[›❯>][ \t]*$",
-            normalized_screen,
-        )
-    )
+    for raw_line in reversed(normalized_screen.splitlines()):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if re.fullmatch(r"[─━\-_=]{3,}", line):
+            continue
+        return bool(re.fullmatch(r"[›❯>]", line))
+    return False
 
 
 def _infer_profile(command: str, profile: Optional[str]) -> Optional[str]:

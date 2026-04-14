@@ -127,7 +127,10 @@ def _screen_has_input_prompt(screen_text: str) -> bool:
             continue
         if re.fullmatch(r"[─━\-_=]{3,}", line):
             continue
-        return bool(re.fullmatch(r"[›❯>]", line))
+        if re.fullmatch(r"[›❯>]", line):
+            return True
+        if re.fullmatch(r"[›❯>][ \t]+.+", line):
+            return False
     return False
 
 

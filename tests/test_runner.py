@@ -387,6 +387,60 @@ class PatternWatcherTests(unittest.TestCase):
 
         self.assertIsNotNone(matched)
 
+    def test_claude_retry_rule_allows_blank_prompt_with_status_footer(self) -> None:
+        self.watcher._profile = "claude"
+        self.watcher._rule_patterns = [
+            (
+                re.compile(r"API Error:\s*500", re.IGNORECASE),
+                {
+                    "response": "retry\r",
+                    "label": "Claude retryable API server error",
+                    "delay": 30.0,
+                    "allow_plain_prompt": True,
+                },
+            )
+        ]
+
+        matched = self.watcher._match(
+            'API Error: 500 {"error":{"code":500,"message":"relay: 当前模型负载过高，请稍后重试","type":"server_error"}}\n'
+            "✻ Brewed for 3m 32s\n\n"
+            "────────────────────\n"
+            "❯\n"
+            "─────────────────\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ctrl+t to hide tasks",
+            self.watcher._rule_patterns,
+        )
+
+        self.assertIsNotNone(matched)
+
+    def test_claude_retry_rule_ignores_unrecognized_footer_text_below_prompt(
+        self,
+    ) -> None:
+        self.watcher._profile = "claude"
+        self.watcher._rule_patterns = [
+            (
+                re.compile(r"API Error:\s*500", re.IGNORECASE),
+                {
+                    "response": "retry\r",
+                    "label": "Claude retryable API server error",
+                    "delay": 30.0,
+                    "allow_plain_prompt": True,
+                },
+            )
+        ]
+
+        matched = self.watcher._match(
+            'API Error: 500 {"error":{"code":500,"message":"relay: 当前模型负载过高，请稍后重试","type":"server_error"}}\n'
+            "✻ Brewed for 3m 32s\n\n"
+            "────────────────────\n"
+            "❯\n"
+            "─────────────────\n"
+            "  some future footer text that dog does not know about yet",
+            self.watcher._rule_patterns,
+        )
+
+        self.assertIsNotNone(matched)
+
     @patch("dog.runner.console.print")
     def test_interruption_screen_blocks_followup_retry(self, _print) -> None:
         self.watcher._profile = "codex"

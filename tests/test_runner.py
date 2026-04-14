@@ -17,7 +17,13 @@ from dog.runner import (
     _infer_profile,
     _signature_id,
 )
-from dog.patterns import COMMON_RETRY_RULES, PERMISSION_RULES, RETRY_RULES, SUCCESS_PATTERNS, TOOL_RETRY_RULES
+from dog.patterns import (
+    COMMON_RETRY_RULES,
+    PERMISSION_RULES,
+    RETRY_RULES,
+    SUCCESS_PATTERNS,
+    TOOL_RETRY_RULES,
+)
 
 
 class FakeChild:
@@ -48,7 +54,9 @@ class FakeChild:
     def close(self, force: bool = False) -> None:
         self.closed = force
 
-    def interact(self, escape_character=None, input_filter=None, output_filter=None) -> None:
+    def interact(
+        self, escape_character=None, input_filter=None, output_filter=None
+    ) -> None:
         if input_filter is not None:
             input_filter(b"")
         if output_filter is not None:
@@ -115,7 +123,9 @@ class PatternWatcherTests(unittest.TestCase):
 
     @patch("dog.runner.console.print")
     @patch("dog.runner.time.sleep", return_value=None)
-    def test_do_retry_sends_response_and_increments_counter(self, _sleep, _print) -> None:
+    def test_do_retry_sends_response_and_increments_counter(
+        self, _sleep, _print
+    ) -> None:
         rule = {"label": "network", "response": "retry\r", "delay": 0}
         self.watcher._buf = "retry me"
 
@@ -139,7 +149,9 @@ class PatternWatcherTests(unittest.TestCase):
 
     @patch("dog.runner.console.print")
     @patch("dog.runner.time.sleep", return_value=None)
-    def test_do_permission_selects_bypass_permissions_menu(self, _sleep, _print) -> None:
+    def test_do_permission_selects_bypass_permissions_menu(
+        self, _sleep, _print
+    ) -> None:
         rule = {"label": "bypass", "response": "1\r", "delay": 0}
 
         self.watcher._do_permission(rule, "Would you like to proceed?")
@@ -151,7 +163,10 @@ class PatternWatcherTests(unittest.TestCase):
         self.child.exitstatus = None
         done = threading.Thread(
             target=self.watcher._do_retry,
-            args=({"label": "network", "response": "retry\r", "delay": 5.0}, "network error"),
+            args=(
+                {"label": "network", "response": "retry\r", "delay": 5.0},
+                "network error",
+            ),
         )
 
         done.start()
@@ -172,12 +187,16 @@ class PatternWatcherTests(unittest.TestCase):
     @patch("dog.runner.console.print")
     @patch("dog.runner.time.sleep", return_value=None)
     @patch("dog.runner.os._exit", side_effect=SystemExit(3))
-    def test_do_retry_exits_when_retry_budget_is_exhausted(self, _exit, _sleep, _print) -> None:
+    def test_do_retry_exits_when_retry_budget_is_exhausted(
+        self, _exit, _sleep, _print
+    ) -> None:
         signature_id = _signature_id("network", "network error")
         self.watcher._retry_counts = {signature_id: 2}
 
         with self.assertRaises(SystemExit) as ctx:
-            self.watcher._do_retry({"label": "network", "response": "retry\r", "delay": 0}, "network error")
+            self.watcher._do_retry(
+                {"label": "network", "response": "retry\r", "delay": 0}, "network error"
+            )
 
         self.assertEqual(ctx.exception.code, 3)
         self.assertTrue(self.child.closed)
@@ -202,11 +221,16 @@ class PatternWatcherTests(unittest.TestCase):
 
     @patch("dog.runner.console.print")
     @patch("dog.runner.time.sleep", return_value=None)
-    def test_success_state_blocks_followup_retry_until_user_submits_again(self, _sleep, _print) -> None:
+    def test_success_state_blocks_followup_retry_until_user_submits_again(
+        self, _sleep, _print
+    ) -> None:
         self.watcher._success_seen = True
         self.watcher._buf = "stream disconnected before completion"
         self.watcher._rule_patterns = [
-            (re.compile(r"stream disconnected", re.IGNORECASE), {"response": "continue\r", "label": "codex", "delay": 0})
+            (
+                re.compile(r"stream disconnected", re.IGNORECASE),
+                {"response": "continue\r", "label": "codex", "delay": 0},
+            )
         ]
 
         self.watcher.note_user_input(b"\r")
@@ -218,12 +242,17 @@ class PatternWatcherTests(unittest.TestCase):
 
     def test_match_skips_same_trigger_until_state_resets(self) -> None:
         self.watcher._rule_patterns = [
-            (re.compile(r"network error", re.IGNORECASE), {"response": "continue\r", "label": "codex"})
+            (
+                re.compile(r"network error", re.IGNORECASE),
+                {"response": "continue\r", "label": "codex"},
+            )
         ]
 
         first = self.watcher._match("network error", self.watcher._rule_patterns)
         self.assertIsNotNone(first)
-        self.watcher._last_triggered_at[_signature_id("codex", "network error")] = 10_000.0
+        self.watcher._last_triggered_at[_signature_id("codex", "network error")] = (
+            10_000.0
+        )
 
         with patch("dog.runner.time.monotonic", return_value=10_001.0):
             second = self.watcher._match("network error", self.watcher._rule_patterns)
@@ -291,6 +320,48 @@ class PatternWatcherTests(unittest.TestCase):
 
         self.assertIsNone(matched)
 
+    def test_claude_retry_rule_allows_blank_prompt_resume(self) -> None:
+        self.watcher._profile = "claude"
+        self.watcher._rule_patterns = [
+            (
+                re.compile(r"API Error:\s*500", re.IGNORECASE),
+                {
+                    "response": "retry\r",
+                    "label": "Claude retryable API server error",
+                    "delay": 30.0,
+                    "allow_plain_prompt": True,
+                },
+            )
+        ]
+
+        matched = self.watcher._match(
+            'API Error: 500 {"error":{"code":500,"message":"relay: 当前模型负载过高，请稍后重试","type":"server_error"}}\n❯ ',
+            self.watcher._rule_patterns,
+        )
+
+        self.assertIsNotNone(matched)
+
+    def test_claude_retry_rule_does_not_send_into_nonblank_prompt(self) -> None:
+        self.watcher._profile = "claude"
+        self.watcher._rule_patterns = [
+            (
+                re.compile(r"API Error:\s*500", re.IGNORECASE),
+                {
+                    "response": "retry\r",
+                    "label": "Claude retryable API server error",
+                    "delay": 30.0,
+                    "allow_plain_prompt": True,
+                },
+            )
+        ]
+
+        matched = self.watcher._match(
+            'API Error: 500 {"error":{"code":500,"message":"relay: 当前模型负载过高，请稍后重试","type":"server_error"}}\n❯ retry later',
+            self.watcher._rule_patterns,
+        )
+
+        self.assertIsNone(matched)
+
     @patch("dog.runner.console.print")
     def test_interruption_screen_blocks_followup_retry(self, _print) -> None:
         self.watcher._profile = "codex"
@@ -328,11 +399,12 @@ class PatternWatcherTests(unittest.TestCase):
 
     @patch("dog.runner.console.print")
     @patch("dog.runner.time.sleep", return_value=None)
-    def test_do_retry_selects_highlighted_retry_menu_with_enter(self, _sleep, _print) -> None:
+    def test_do_retry_selects_highlighted_retry_menu_with_enter(
+        self, _sleep, _print
+    ) -> None:
         rule = {"label": "rate limit", "response": "retry\r", "delay": 0}
         self.watcher._buf = (
-            "exceeded retry limit, last status: 429 Too Many Requests\n"
-            "› retry"
+            "exceeded retry limit, last status: 429 Too Many Requests\n› retry"
         )
 
         self.watcher._do_retry(rule, "429 too many requests")
@@ -341,7 +413,9 @@ class PatternWatcherTests(unittest.TestCase):
 
     @patch("dog.runner.console.print")
     @patch("dog.runner.time.sleep", return_value=None)
-    def test_do_retry_selects_highlighted_continue_menu_with_enter(self, _sleep, _print) -> None:
+    def test_do_retry_selects_highlighted_continue_menu_with_enter(
+        self, _sleep, _print
+    ) -> None:
         rule = {"label": "stream disconnected", "response": "continue\r", "delay": 0}
         self.watcher._buf = "stream disconnected before completion\n❯ continue"
 
@@ -351,8 +425,14 @@ class PatternWatcherTests(unittest.TestCase):
 
     @patch("dog.runner.console.print")
     @patch("dog.runner.time.sleep", return_value=None)
-    def test_do_retry_selects_highlighted_continue_menu_with_ansi_word_styling(self, _sleep, _print) -> None:
-        rule = {"label": "Codex 429 Too Many Requests", "response": "continue\r", "delay": 0}
+    def test_do_retry_selects_highlighted_continue_menu_with_ansi_word_styling(
+        self, _sleep, _print
+    ) -> None:
+        rule = {
+            "label": "Codex 429 Too Many Requests",
+            "response": "continue\r",
+            "delay": 0,
+        }
         self.watcher._buf = (
             "exceeded retry limit, last status: 429 Too Many Requests\n"
             "❯ \x1b[7mcontinue\x1b[0m"
@@ -364,12 +444,15 @@ class PatternWatcherTests(unittest.TestCase):
 
     @patch("dog.runner.console.print")
     def test_do_retry_waits_for_prompt_before_sending_continue(self, _print) -> None:
-        rule = {"label": "Codex 429 Too Many Requests", "response": "continue\r", "delay": 30.0}
+        rule = {
+            "label": "Codex 429 Too Many Requests",
+            "response": "continue\r",
+            "delay": 30.0,
+        }
 
         def finish_wait(*args, **kwargs) -> bool:
             self.watcher._buf = (
-                "exceeded retry limit, last status: 429 Too Many Requests\n"
-                "› "
+                "exceeded retry limit, last status: 429 Too Many Requests\n› "
             )
             return True
 
@@ -380,12 +463,15 @@ class PatternWatcherTests(unittest.TestCase):
 
     @patch("dog.runner.console.print")
     def test_do_retry_rechecks_screen_after_wait_before_sending(self, _print) -> None:
-        rule = {"label": "Codex 429 Too Many Requests", "response": "continue\r", "delay": 30.0}
+        rule = {
+            "label": "Codex 429 Too Many Requests",
+            "response": "continue\r",
+            "delay": 30.0,
+        }
 
         def finish_wait(*args, **kwargs) -> bool:
             self.watcher._buf = (
-                "exceeded retry limit, last status: 429 Too Many Requests\n"
-                "❯ continue"
+                "exceeded retry limit, last status: 429 Too Many Requests\n❯ continue"
             )
             return True
 
@@ -397,12 +483,16 @@ class PatternWatcherTests(unittest.TestCase):
     @patch("dog.runner.console.print")
     def test_wait_for_input_prompt_requires_quiet_period(self, _print) -> None:
         self.watcher._profile = "codex"
-        self.watcher._buf = "exceeded retry limit, last status: 429 Too Many Requests\n> "
+        self.watcher._buf = (
+            "exceeded retry limit, last status: 429 Too Many Requests\n> "
+        )
         self.watcher._last_output_at = 100.0
         rule = {"response": "continue\r", "allow_plain_prompt": True}
 
         with (
-            patch("dog.runner.time.monotonic", side_effect=[100.0, 100.1, 100.1, 100.5]),
+            patch(
+                "dog.runner.time.monotonic", side_effect=[100.0, 100.1, 100.1, 100.5]
+            ),
             patch.object(self.watcher._stop_event, "wait", side_effect=[False, False]),
         ):
             response = self.watcher._wait_for_input_prompt(
@@ -433,7 +523,10 @@ class PatternWatcherTests(unittest.TestCase):
         watcher._last_output_at = 100.0
 
         with (
-            patch("dog.runner.time.monotonic", side_effect=[100.0, 100.5, 100.7, 100.7, 100.9]),
+            patch(
+                "dog.runner.time.monotonic",
+                side_effect=[100.0, 100.5, 100.7, 100.7, 100.9],
+            ),
             patch.object(watcher._stop_event, "wait", side_effect=[False]),
         ):
             response = watcher._wait_for_input_prompt(
@@ -446,6 +539,42 @@ class PatternWatcherTests(unittest.TestCase):
 
         self.assertEqual(response, "continue\r")
 
+    @patch("dog.runner.console.print")
+    def test_wait_for_input_prompt_supports_claude_ready_prompt(self, _print) -> None:
+        watcher = PatternWatcher(
+            child=self.child,
+            rule_patterns=[],
+            permission_patterns=[],
+            fatal_re=re.compile(r"fatal"),
+            interrupt_re=re.compile(r"interrupted"),
+            success_re=re.compile(r"done"),
+            max_retries=2,
+            auto_permission=True,
+            profile="claude",
+        )
+        watcher._buf = (
+            'API Error: 500 {"error":{"code":500,"message":"relay: 当前模型负载过高，请稍后重试","type":"server_error"}}\n'
+            "❯ "
+        )
+        watcher._last_output_at = 100.0
+
+        with (
+            patch(
+                "dog.runner.time.monotonic",
+                side_effect=[100.0, 100.5, 100.7, 100.7, 100.9],
+            ),
+            patch.object(watcher._stop_event, "wait", side_effect=[False]),
+        ):
+            response = watcher._wait_for_input_prompt(
+                {"response": "retry\r", "allow_plain_prompt": True},
+                "retry\r",
+                action="retry",
+                label="Claude retryable API server error",
+                retry_count=1,
+            )
+
+        self.assertEqual(response, "retry\r")
+
     def test_match_allows_same_signature_again_after_cooldown(self) -> None:
         rule = {"response": "continue\r", "label": "codex", "delay": 1.0}
         self.watcher._rule_patterns = [
@@ -455,11 +584,15 @@ class PatternWatcherTests(unittest.TestCase):
         self.watcher._last_triggered_at[signature_id] = 100.0
 
         with patch("dog.runner.time.monotonic", return_value=101.0):
-            blocked = self.watcher._match("stream disconnected", self.watcher._rule_patterns)
+            blocked = self.watcher._match(
+                "stream disconnected", self.watcher._rule_patterns
+            )
         self.assertIsNone(blocked)
 
         with patch("dog.runner.time.monotonic", return_value=102.1):
-            allowed = self.watcher._match("stream disconnected", self.watcher._rule_patterns)
+            allowed = self.watcher._match(
+                "stream disconnected", self.watcher._rule_patterns
+            )
         self.assertIsNotNone(allowed)
 
     def test_feed_suppresses_recent_auto_echo_line(self) -> None:
@@ -484,7 +617,9 @@ class PatternWatcherTests(unittest.TestCase):
         self.assertEqual(visible, b"\n\n")
         self.assertEqual(self.watcher._buf, "\n\n")
 
-    def test_feed_suppresses_recent_auto_echo_line_with_unicode_prompt_marker(self) -> None:
+    def test_feed_suppresses_recent_auto_echo_line_with_unicode_prompt_marker(
+        self,
+    ) -> None:
         pattern = _build_echo_bytes_pattern("continue\r")
         self.assertIsNotNone(pattern)
         self.watcher._pending_echo_suppression = [(pattern, 999.0)]
@@ -495,7 +630,9 @@ class PatternWatcherTests(unittest.TestCase):
         self.assertEqual(visible, b"\n")
         self.assertEqual(self.watcher._buf, "\n")
 
-    def test_feed_suppresses_recent_auto_echo_line_without_trailing_newline(self) -> None:
+    def test_feed_suppresses_recent_auto_echo_line_without_trailing_newline(
+        self,
+    ) -> None:
         pattern = _build_echo_bytes_pattern("continue\r")
         self.assertIsNotNone(pattern)
         self.watcher._pending_echo_suppression = [(pattern, 999.0)]
@@ -548,8 +685,15 @@ class PatternWatcherTests(unittest.TestCase):
         with (
             patch("dog.runner.sys.stdout", FakeTTYStream()),
             patch("dog.runner.sys.stderr", stderr),
-            patch.object(self.watcher._stop_event, "wait", side_effect=[False, False, False, False, False]),
-            patch("dog.runner.time.monotonic", side_effect=[100.0, 100.0, 100.6, 101.2, 101.8, 102.1]),
+            patch.object(
+                self.watcher._stop_event,
+                "wait",
+                side_effect=[False, False, False, False, False],
+            ),
+            patch(
+                "dog.runner.time.monotonic",
+                side_effect=[100.0, 100.0, 100.6, 101.2, 101.8, 102.1],
+            ),
         ):
             finished = self.watcher._wait_with_progress(
                 2.0,
@@ -560,8 +704,14 @@ class PatternWatcherTests(unittest.TestCase):
             )
 
         self.assertTrue(finished)
-        self.assertIn("dog retry 1/2: Codex 429 Too Many Requests; sending 'continue' in 2.0s", stderr.getvalue())
-        self.assertIn("dog retry 1/2: Codex 429 Too Many Requests; sending 'continue' in 1.4s", stderr.getvalue())
+        self.assertIn(
+            "dog retry 1/2: Codex 429 Too Many Requests; sending 'continue' in 2.0s",
+            stderr.getvalue(),
+        )
+        self.assertIn(
+            "dog retry 1/2: Codex 429 Too Many Requests; sending 'continue' in 1.4s",
+            stderr.getvalue(),
+        )
         self.assertTrue(stderr.getvalue().endswith("\r\033[2K"))
 
     def test_wait_for_idle_waits_for_pending_notify_to_drain(self) -> None:
@@ -574,7 +724,9 @@ class PatternWatcherTests(unittest.TestCase):
         thread = threading.Thread(target=clear_pending)
         thread.start()
         try:
-            drained = self.watcher.wait_for_idle(start_timeout=0.01, finish_timeout=0.20)
+            drained = self.watcher.wait_for_idle(
+                start_timeout=0.01, finish_timeout=0.20
+            )
         finally:
             thread.join(timeout=1.0)
 
@@ -583,32 +735,50 @@ class PatternWatcherTests(unittest.TestCase):
     def test_do_retry_logs_single_line_without_terminal_rewrite_codes(self) -> None:
         stderr = io.StringIO()
         stderr.isatty = lambda: False  # type: ignore[attr-defined]
-        rule = {"label": "Codex 429 Too Many Requests", "response": "continue\r", "delay": 30.0}
+        rule = {
+            "label": "Codex 429 Too Many Requests",
+            "response": "continue\r",
+            "delay": 30.0,
+        }
 
         with (
             patch("dog.runner.sys.stderr", stderr),
             patch.object(self.watcher, "_wait_with_progress", return_value=True),
-            patch.object(self.watcher, "_wait_for_input_prompt", return_value="continue\r"),
+            patch.object(
+                self.watcher, "_wait_for_input_prompt", return_value="continue\r"
+            ),
         ):
             self.watcher._do_retry(rule, "429 too many requests")
 
-        self.assertIn("dog retry 1/2: Codex 429 Too Many Requests; sending 'continue' in 30.0s", stderr.getvalue())
+        self.assertIn(
+            "dog retry 1/2: Codex 429 Too Many Requests; sending 'continue' in 30.0s",
+            stderr.getvalue(),
+        )
         self.assertNotIn("\r\033[2K", stderr.getvalue())
 
     def test_do_retry_shows_transient_status_on_interactive_tty(self) -> None:
         stdout = FakeTTYStream()
         stderr = FakeTTYStream()
-        rule = {"label": "Codex 429 Too Many Requests", "response": "continue\r", "delay": 30.0}
+        rule = {
+            "label": "Codex 429 Too Many Requests",
+            "response": "continue\r",
+            "delay": 30.0,
+        }
 
         with (
             patch("dog.runner.sys.stdout", stdout),
             patch("dog.runner.sys.stderr", stderr),
             patch.object(self.watcher, "_wait_with_progress", return_value=True),
-            patch.object(self.watcher, "_wait_for_input_prompt", return_value="continue\r"),
+            patch.object(
+                self.watcher, "_wait_for_input_prompt", return_value="continue\r"
+            ),
         ):
             self.watcher._do_retry(rule, "429 too many requests")
 
-        self.assertIn("\r\033[2Kdog retry 1/2: Codex 429 Too Many Requests; sending 'continue' in 30.0s", stderr.getvalue())
+        self.assertIn(
+            "\r\033[2Kdog retry 1/2: Codex 429 Too Many Requests; sending 'continue' in 30.0s",
+            stderr.getvalue(),
+        )
         self.assertEqual(stdout.getvalue(), "")
 
 
@@ -619,7 +789,9 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(_infer_profile("opencode run", None), "opencode")
         self.assertIsNone(_infer_profile("python tool.py", None))
 
-    def test_build_retry_rules_excludes_generic_network_matching_for_claude(self) -> None:
+    def test_build_retry_rules_excludes_generic_network_matching_for_claude(
+        self,
+    ) -> None:
         rules = _build_retry_rules("claude")
         labels = {rule["label"] for rule in rules}
 
@@ -728,13 +900,15 @@ class RunnerTests(unittest.TestCase):
         exit_code = Runner(
             "codex",
             max_retries=2,
-            extra_rules=[{
-                "label": "test retry",
-                "pattern": r"stream disconnected before completion",
-                "response": "continue\r",
-                "delay": 0.05,
-                "priority": 1,
-            }],
+            extra_rules=[
+                {
+                    "label": "test retry",
+                    "pattern": r"stream disconnected before completion",
+                    "response": "continue\r",
+                    "delay": 0.05,
+                    "priority": 1,
+                }
+            ],
         ).run()
 
         self.assertEqual(exit_code, 0)
@@ -765,13 +939,15 @@ class RunnerTests(unittest.TestCase):
         exit_code = Runner(
             "codex",
             max_retries=2,
-            extra_rules=[{
-                "label": "test retry",
-                "pattern": r"retryable failure",
-                "response": "continue\r",
-                "delay": 0.05,
-                "priority": 1,
-            }],
+            extra_rules=[
+                {
+                    "label": "test retry",
+                    "pattern": r"retryable failure",
+                    "response": "continue\r",
+                    "delay": 0.05,
+                    "priority": 1,
+                }
+            ],
         ).run()
 
         self.assertEqual(exit_code, 0)
@@ -812,13 +988,15 @@ class RunnerTests(unittest.TestCase):
             exit_code = Runner(
                 "codex",
                 max_retries=2,
-                extra_rules=[{
-                    "label": "test retry",
-                    "pattern": r"retryable failure",
-                    "response": "continue\r",
-                    "delay": 0.0,
-                    "priority": 1,
-                }],
+                extra_rules=[
+                    {
+                        "label": "test retry",
+                        "pattern": r"retryable failure",
+                        "response": "continue\r",
+                        "delay": 0.0,
+                        "priority": 1,
+                    }
+                ],
             ).run()
 
         self.assertEqual(exit_code, 0)
@@ -895,7 +1073,9 @@ class RunnerTests(unittest.TestCase):
 
 
 class PatternRulesTests(unittest.TestCase):
-    def test_permission_rules_choose_bypass_permissions_for_execution_menu(self) -> None:
+    def test_permission_rules_choose_bypass_permissions_for_execution_menu(
+        self,
+    ) -> None:
         text = (
             "Claude has written up a plan and is ready to execute. Would you like to proceed?\n\n"
             "❯ 1. Yes, and bypass permissions\n"
@@ -910,7 +1090,10 @@ class PatternRulesTests(unittest.TestCase):
                 break
 
         self.assertIsNotNone(matched)
-        self.assertEqual(matched["label"], "Permission: Claude execution plan menu → choose bypass permissions")
+        self.assertEqual(
+            matched["label"],
+            "Permission: Claude execution plan menu → choose bypass permissions",
+        )
         self.assertEqual(matched["response"], "1\r")
 
     def test_opencode_highlighted_continue_rule_prefers_enter(self) -> None:
@@ -924,7 +1107,9 @@ class PatternRulesTests(unittest.TestCase):
                 break
 
         self.assertIsNotNone(matched)
-        self.assertEqual(matched["label"], "Opencode highlighted continue after recoverable failure")
+        self.assertEqual(
+            matched["label"], "Opencode highlighted continue after recoverable failure"
+        )
         self.assertEqual(matched["response"], "\r")
 
     def test_opencode_429_uses_continue_resume(self) -> None:
@@ -952,7 +1137,9 @@ class PatternRulesTests(unittest.TestCase):
                 break
 
         self.assertIsNotNone(matched)
-        self.assertEqual(matched["label"], "Codex stream disconnected before completion")
+        self.assertEqual(
+            matched["label"], "Codex stream disconnected before completion"
+        )
         self.assertEqual(matched["response"], "continue\r")
 
     def test_codex_direct_stream_closed_message_uses_continue(self) -> None:
@@ -966,7 +1153,9 @@ class PatternRulesTests(unittest.TestCase):
                 break
 
         self.assertIsNotNone(matched)
-        self.assertEqual(matched["label"], "Codex stream disconnected before completion")
+        self.assertEqual(
+            matched["label"], "Codex stream disconnected before completion"
+        )
         self.assertEqual(matched["response"], "continue\r")
 
     def test_codex_429_uses_continue_instead_of_generic_retry(self) -> None:
@@ -984,15 +1173,22 @@ class PatternRulesTests(unittest.TestCase):
         self.assertEqual(matched["response"], "continue\r")
 
     def test_codex_chinese_completion_summary_matches_success_patterns(self) -> None:
-        success_re = re.compile("|".join(f"(?:{pattern})" for pattern in SUCCESS_PATTERNS), re.IGNORECASE)
+        success_re = re.compile(
+            "|".join(f"(?:{pattern})" for pattern in SUCCESS_PATTERNS), re.IGNORECASE
+        )
         text = "• 已按 docs 的 Stage 1 文档完成第一版落地。现在工程从模板改成了 iOS 15 基线的 Stage 1 结构。"
 
         self.assertIsNotNone(success_re.search(text))
 
-    def test_claude_retries_rely_on_explicit_prompts_not_generic_network_logs(self) -> None:
+    def test_claude_retries_rely_on_explicit_prompts_not_generic_network_logs(
+        self,
+    ) -> None:
         rules = _build_retry_rules("claude")
-        timeout_text = "Playwright TimeoutError: locator.click: Timeout 30000ms exceeded"
+        timeout_text = (
+            "Playwright TimeoutError: locator.click: Timeout 30000ms exceeded"
+        )
         retry_prompt_text = "API Error: Network error\n(y to retry)"
+        retryable_api_error_text = 'API Error: 500 {"error":{"code":500,"message":"relay: 当前模型负载过高，请稍后重试","type":"server_error"}}'
 
         timeout_match = None
         for rule in rules:
@@ -1006,6 +1202,18 @@ class PatternRulesTests(unittest.TestCase):
                 retry_prompt_match = rule
                 break
 
+        retryable_api_error_match = None
+        for rule in rules:
+            if re.search(rule["pattern"], retryable_api_error_text, re.IGNORECASE):
+                retryable_api_error_match = rule
+                break
+
         self.assertIsNone(timeout_match)
         self.assertIsNotNone(retry_prompt_match)
-        self.assertEqual(retry_prompt_match["label"], "Claude explicit (y to retry) prompt")
+        self.assertEqual(
+            retry_prompt_match["label"], "Claude explicit (y to retry) prompt"
+        )
+        self.assertIsNotNone(retryable_api_error_match)
+        self.assertEqual(
+            retryable_api_error_match["label"], "Claude retryable API server error"
+        )

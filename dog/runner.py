@@ -22,6 +22,7 @@ Signal handling
   SIGWINCH: we forward the new terminal size to the child PTY
   SIGTERM / close tab: SIGHUP propagates naturally through the PTY chain
 """
+
 from __future__ import annotations
 
 import codecs
@@ -110,7 +111,7 @@ def _select_highlighted_response(response: str, screen_text: str) -> str:
 
     normalized_screen = _ANSI_RE.sub("", screen_text)
     pattern = re.compile(
-        rf"(?:^|[\r\n]){_HIGHLIGHTED_ACTION_PREFIX_RE}{re.escape(stripped)}\b",
+        rf"(?:^|[\r\n]){_HIGHLIGHTED_ACTION_PREFIX_RE}{re.escape(stripped)}(?=[ \t]*(?:$|[\r\n]))",
         re.IGNORECASE,
     )
     if pattern.search(normalized_screen):
@@ -135,7 +136,9 @@ def _infer_profile(command: str, profile: Optional[str]) -> Optional[str]:
     return first if first in {"claude", "codex", "opencode"} else None
 
 
-def _build_retry_rules(profile: Optional[str], extra_rules: Optional[list[dict]] = None) -> list[dict]:
+def _build_retry_rules(
+    profile: Optional[str], extra_rules: Optional[list[dict]] = None
+) -> list[dict]:
     rules: list[dict] = []
     if profile != "claude":
         rules.extend(COMMON_RETRY_RULES)
@@ -146,7 +149,9 @@ def _build_retry_rules(profile: Optional[str], extra_rules: Optional[list[dict]]
     return sorted(rules, key=lambda r: r.get("priority", 50))
 
 
-def _status_write(message: str = "", *, newline: bool = False, clear: bool = False) -> None:
+def _status_write(
+    message: str = "", *, newline: bool = False, clear: bool = False
+) -> None:
     global _LAST_STATUS_MESSAGE
     with _STATUS_LOCK:
         if _interactive_tty():
@@ -212,6 +217,7 @@ def _format_wait_status(
 # Pattern watcher — runs in a background daemon thread
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class PatternWatcher:
     """
     Consumes child output (fed via .feed()), scans for patterns,
@@ -232,19 +238,19 @@ class PatternWatcher:
         profile: Optional[str] = None,
         retry_counts: Optional[dict[str, int]] = None,
     ) -> None:
-        self._child            = child
-        self._rule_patterns    = rule_patterns
-        self._perm_patterns    = permission_patterns
-        self._fatal_re         = fatal_re
-        self._interrupt_re     = interrupt_re
-        self._success_re       = success_re
-        self._max_retries      = max_retries
-        self._auto_permission  = auto_permission
-        self._profile          = profile
+        self._child = child
+        self._rule_patterns = rule_patterns
+        self._perm_patterns = permission_patterns
+        self._fatal_re = fatal_re
+        self._interrupt_re = interrupt_re
+        self._success_re = success_re
+        self._max_retries = max_retries
+        self._auto_permission = auto_permission
+        self._profile = profile
 
-        self._buf      = ""
-        self._lock     = threading.Lock()
-        self._notify   = threading.Event()
+        self._buf = ""
+        self._lock = threading.Lock()
+        self._notify = threading.Event()
         self._stop_event = threading.Event()
         self._retry_counts = retry_counts if retry_counts is not None else {}
         self._success_seen = False
@@ -286,7 +292,9 @@ class PatternWatcher:
             self._restart_request = None
             return request
 
-    def wait_for_idle(self, start_timeout: float = 0.25, finish_timeout: float = 0.0) -> bool:
+    def wait_for_idle(
+        self, start_timeout: float = 0.25, finish_timeout: float = 0.0
+    ) -> bool:
         timeout = max(start_timeout, 0.0) + max(finish_timeout, 0.0)
         deadline = time.monotonic() + timeout
 
@@ -310,7 +318,11 @@ class PatternWatcher:
     def _suppress_auto_echo_bytes(self, data: bytes) -> bytes:
         now = time.monotonic()
         with self._lock:
-            rules = [(pattern, expires_at) for pattern, expires_at in self._pending_echo_suppression if expires_at > now]
+            rules = [
+                (pattern, expires_at)
+                for pattern, expires_at in self._pending_echo_suppression
+                if expires_at > now
+            ]
             self._pending_echo_suppression = rules
 
         if not rules:
@@ -461,27 +473,29 @@ class PatternWatcher:
                 _status_clear()
                 return False
 
-    def _response_needs_settled_prompt(self, response: str) -> bool:
+    def _response_needs_settled_prompt(
+        self, response: str, rule: Optional[dict] = None
+    ) -> bool:
         stripped = response.strip().lower()
         if stripped not in {"retry", "continue"}:
             return False
+        if rule and rule.get("allow_plain_prompt"):
+            return True
         return self._profile in {"codex", "opencode"}
 
-    def _ready_response_for_profile(self, rule: dict, response: str, screen_text: str) -> tuple[bool, str]:
+    def _ready_response_for_profile(
+        self, rule: dict, response: str, screen_text: str
+    ) -> tuple[bool, str]:
         selected = _select_highlighted_response(response, screen_text)
         if selected == "\r":
             return True, selected
-        if (
-            self._profile in {"codex", "opencode"}
-            and rule.get("allow_plain_prompt")
-            and _screen_has_input_prompt(screen_text)
-        ):
+        if rule.get("allow_plain_prompt") and _screen_has_input_prompt(screen_text):
             return True, selected
         return False, selected
 
     def _rule_is_actionable(self, rule: dict, screen_text: str) -> bool:
         response = rule.get("response", "retry\n")
-        if not self._response_needs_settled_prompt(response):
+        if not self._response_needs_settled_prompt(response, rule):
             return True
         if not self._child_is_alive():
             return True
@@ -501,7 +515,7 @@ class PatternWatcher:
         quiet_period: float = 0.35,
         stable_period: float = 0.15,
     ) -> Optional[str]:
-        if not self._response_needs_settled_prompt(response):
+        if not self._response_needs_settled_prompt(response, rule):
             return response
 
         deadline = time.monotonic() + max(timeout, 0.0)
@@ -513,7 +527,9 @@ class PatternWatcher:
                 last_output_at = self._last_output_at
 
             now = time.monotonic()
-            prompt_ready, selected = self._ready_response_for_profile(rule, response, screen_text)
+            prompt_ready, selected = self._ready_response_for_profile(
+                rule, response, screen_text
+            )
             screen_signature = _normalize_signature(screen_text)
             if prompt_ready:
                 if screen_signature != ready_signature:
@@ -524,7 +540,9 @@ class PatternWatcher:
                 ready_since = None
 
             output_quiet = (now - last_output_at) >= max(quiet_period, 0.0)
-            prompt_stable = ready_since is not None and (now - ready_since) >= max(stable_period, 0.0)
+            prompt_stable = ready_since is not None and (now - ready_since) >= max(
+                stable_period, 0.0
+            )
             if prompt_ready and output_quiet and prompt_stable:
                 _status_clear()
                 return selected
@@ -582,8 +600,8 @@ class PatternWatcher:
             self._idle_event.clear()
         try:
             self._retry_counts = {}
-            delay    = rule.get("delay", 0.3)
-            label    = rule.get("label", "permission")
+            delay = rule.get("delay", 0.3)
+            label = rule.get("label", "permission")
             response = rule.get("response", "y\n")
 
             _status_log(
@@ -601,7 +619,9 @@ class PatternWatcher:
             self._safe_send(response)
             with self._lock:
                 self._buf = ""
-                self._last_triggered_at[_signature_id(label, matched_text)] = time.monotonic()
+                self._last_triggered_at[_signature_id(label, matched_text)] = (
+                    time.monotonic()
+                )
             self._last_action_time = time.monotonic()
         finally:
             with self._lock:
@@ -632,7 +652,7 @@ class PatternWatcher:
 
             retry_count += 1
             self._retry_counts[signature_id] = retry_count
-            delay    = rule.get("delay", 1.0)
+            delay = rule.get("delay", 1.0)
             response = rule.get("response", "retry\n")
             with self._lock:
                 screen_text = self._buf
@@ -650,7 +670,7 @@ class PatternWatcher:
                 retry_count=retry_count,
             ):
                 return
-            if float(delay) > 0 and self._response_needs_settled_prompt(response):
+            if float(delay) > 0 and self._response_needs_settled_prompt(response, rule):
                 response = self._wait_for_input_prompt(
                     rule,
                     response,
@@ -690,7 +710,9 @@ class PatternWatcher:
             pattern = _build_echo_bytes_pattern(text)
             if pattern:
                 with self._lock:
-                    self._pending_echo_suppression.append((pattern, time.monotonic() + 2.5))
+                    self._pending_echo_suppression.append(
+                        (pattern, time.monotonic() + 2.5)
+                    )
             self._child.send(text)
         except pexpect.exceptions.ExceptionPexpect as e:
             console.print(f"[red]dog: send failed:[/] {e}")
@@ -699,6 +721,7 @@ class PatternWatcher:
 # ─────────────────────────────────────────────────────────────────────────────
 # Runner
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class Runner:
     """
@@ -724,31 +747,31 @@ class Runner:
         auto_permission: bool = True,
         profile: Optional[str] = None,
     ) -> None:
-        self.command        = command
-        self.max_retries    = max_retries
-        self.echo           = echo
-        self.timeout        = timeout
+        self.command = command
+        self.max_retries = max_retries
+        self.echo = echo
+        self.timeout = timeout
         self.auto_permission = auto_permission
-        self.profile        = _infer_profile(command, profile)
+        self.profile = _infer_profile(command, profile)
 
         all_rules = _build_retry_rules(self.profile, extra_rules)
 
         self._rule_patterns = [
-            (re.compile(r["pattern"], re.IGNORECASE), r)
-            for r in all_rules
+            (re.compile(r["pattern"], re.IGNORECASE), r) for r in all_rules
         ]
         self._perm_patterns = [
-            (re.compile(r["pattern"], re.IGNORECASE), r)
-            for r in PERMISSION_RULES
+            (re.compile(r["pattern"], re.IGNORECASE), r) for r in PERMISSION_RULES
         ]
-        self._fatal_re  = _compile(FATAL_PATTERNS)
+        self._fatal_re = _compile(FATAL_PATTERNS)
         self._interrupt_re = _compile(INTERRUPTION_PATTERNS)
         self._success_re = _compile(SUCCESS_PATTERNS)
         self._child: Optional[pexpect.spawn] = None
         self._watcher: Optional[PatternWatcher] = None
         self._retry_counts: dict[str, int] = {}
         self._max_action_delay = max(
-            [0.3] + [float(rule.get("delay", 0.0)) for rule in all_rules] + [float(rule.get("delay", 0.0)) for rule in PERMISSION_RULES]
+            [0.3]
+            + [float(rule.get("delay", 0.0)) for rule in all_rules]
+            + [float(rule.get("delay", 0.0)) for rule in PERMISSION_RULES]
         )
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -756,12 +779,11 @@ class Runner:
     def run(self) -> int:
         # Get actual terminal dimensions so Claude Code renders correctly
         import shutil
+
         size = shutil.get_terminal_size(fallback=(80, 24))
         cols, rows = size.columns, size.lines
 
-        console.print(
-            f"[bold cyan]🐕 dog[/] launching: [yellow]{self.command}[/]"
-        )
+        console.print(f"[bold cyan]🐕 dog[/] launching: [yellow]{self.command}[/]")
         console.print(
             "[dim]  Ctrl+C = cancel current task in Claude  │  "
             "auto-permission: %s  │  auto-retry: ON (max %d)[/]"
@@ -773,7 +795,7 @@ class Runner:
             try:
                 self._child = pexpect.spawn(
                     self.command,
-                    encoding=None,       # bytes mode — cleaner for PTY passthrough
+                    encoding=None,  # bytes mode — cleaner for PTY passthrough
                     timeout=self.timeout,
                     echo=False,
                     dimensions=(rows, cols),
@@ -787,6 +809,7 @@ class Runner:
             def _handle_winch(sig, frame):
                 try:
                     import shutil
+
                     size = shutil.get_terminal_size(fallback=(80, 24))
                     self._child.setwinsize(size.lines, size.columns)
                 except Exception:
@@ -820,7 +843,7 @@ class Runner:
             # output_filter captures output into the watcher buffer
             try:
                 self._child.interact(
-                    escape_character=None,              # no special escape char
+                    escape_character=None,  # no special escape char
                     input_filter=self._watcher.note_user_input,
                     output_filter=_output_filter,
                 )
@@ -843,7 +866,11 @@ class Runner:
             except Exception:
                 pass
             code = self._child.exitstatus if self._child.exitstatus is not None else 0
-            restart_request = self._watcher.consume_restart_request() if self._watcher is not None else None
+            restart_request = (
+                self._watcher.consume_restart_request()
+                if self._watcher is not None
+                else None
+            )
 
             if restart_request:
                 if not _interactive_tty():

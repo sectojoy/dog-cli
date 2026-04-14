@@ -8,13 +8,13 @@ Each entry in RETRY_RULES is a dict with:
   delay    : float — seconds to wait before responding (default 1.0)
   priority : int   — lower = checked first (default 50)
 """
+
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
 # AUTO-RETRY RULES — triggered on error output, sends retry command
 # ---------------------------------------------------------------------------
 COMMON_RETRY_RULES: list[dict] = [
-
     # ── Real-world API error strings seen in Claude Code ─────────────────────
     {
         "label": "Certificate / SSL error (UNKNOWN_CERTIFICATE_VERIFICATION_ERROR)",
@@ -98,6 +98,30 @@ TOOL_RETRY_RULES: dict[str, list[dict]] = {
             "response": "\r",
             "delay": 0.3,
             "priority": 5,
+        },
+        {
+            "label": "Claude retryable API server error",
+            "pattern": (
+                r"API Error:\s*(?:429|500|502|503|504)\b"
+                r"|API Error:.*\"type\"\s*:\s*\"server_error\""
+                r"|API Error:.*(?:当前模型负载过高|请稍后重试|model load is too high|try again later)"
+            ),
+            "response": "retry\r",
+            "allow_plain_prompt": True,
+            "delay": 30.0,
+            "priority": 8,
+        },
+        {
+            "label": "Claude retryable API network error",
+            "pattern": (
+                r"API Error:.*(?:Unable to connect to API|[Nn]etwork error|fetch failed"
+                r"|Connection(?:Error| refused|Reset|Timeout)|ECONNREFUSED|ECONNRESET"
+                r"|ENOTFOUND|ETIMEDOUT|certificate verify failed|SSL.*[Ee]rror|CERT_)"
+            ),
+            "response": "retry\r",
+            "allow_plain_prompt": True,
+            "delay": 30.0,
+            "priority": 9,
         },
     ],
     "codex": [
@@ -207,7 +231,7 @@ PERMISSION_RULES: list[dict] = [
         # Claude Code shows a menu: ❯ Yes  No  Always allow
         # The first option is already highlighted — pressing Enter accepts it
         "pattern": r"❯\s+Yes\b|❯\s+Allow\b",
-        "response": "\r",   # Enter = select highlighted option
+        "response": "\r",  # Enter = select highlighted option
         "delay": 0.3,
     },
     {

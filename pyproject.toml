@@ -7,7 +7,7 @@ name = "dog-cli"
 version = "0.1.0"
 description = "Resilient wrapper for Claude Code / OpenAI Codex — auto-retries on API errors & timeouts"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 license = { text = "MIT" }
 dependencies = [
     "pexpect>=4.9",

@@ -7,6 +7,7 @@ echo "📦  Creating virtual environment (.venv) ..."
 python3 -m venv .venv
 
 echo "📦  Installing dog-cli into .venv ..."
+.venv/bin/pip install --upgrade pip -q
 .venv/bin/pip install -e . -q
 
 VENV_BIN="$(pwd)/.venv/bin"
